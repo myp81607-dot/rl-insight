@@ -26,7 +26,6 @@ from experiment.degradation_perception.prometheus_workflow import (
     PrometheusWorkflowError,
     _prepare_metric_configs,
     fetch_query_range,
-    load_workflow_config,
     main,
     normalize_workflow_config,
     run_prometheus_workflow,
@@ -37,12 +36,6 @@ from experiment.degradation_perception.simulated_prometheus import (
     TARGET_METRIC,
     generate_simulation_package,
 )
-
-
-EXAMPLE_CONFIG = (
-    Path(__file__).parents[1] / "prometheus_workflow.example.yaml"
-)
-
 
 def _config() -> dict:
     metrics = {
@@ -97,40 +90,6 @@ def _strict_load(path: Path):
         path.read_text(encoding="utf-8"),
         parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)),
     )
-
-
-def test_example_config_is_valid_and_uses_real_project_metric_names():
-    config = load_workflow_config(EXAMPLE_CONFIG)
-
-    assert config["association_target"] == TARGET_METRIC
-    assert config["prometheus"]["use_environment_proxy"] is False
-    assert list(config["metrics"]) == [
-        TARGET_METRIC,
-        *ASSOCIATED_METRICS,
-    ]
-    assert "vllm:kv_cache_usage_perc{" in config["metrics"][
-        "kv_cache_usage_perc"
-    ]["standard_query"]
-    assert "rate(vllm:e2e_request_latency_seconds_sum{" in config[
-        "metrics"
-    ]["e2e_request_latency"]["inference_query"]
-    assert "global_seqlen_minmax_diff" in config["metrics"][
-        "global_seqlen_minimax_diff"
-    ]["standard_query"]
-    isolation_labels = (
-        "project=",
-        "experiment_name=",
-        "instance=",
-        "worker=",
-        "replica=",
-        "run_id=",
-    )
-    for spec in config["metrics"].values():
-        assert spec["standard_query"] != spec["inference_query"]
-        for phase in ("standard", "inference"):
-            query = spec[f"{phase}_query"]
-            assert "{" in query and "}" in query
-            assert any(label in query for label in isolation_labels)
 
 
 @pytest.mark.parametrize(

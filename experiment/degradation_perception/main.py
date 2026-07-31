@@ -126,7 +126,12 @@ def _strict_json_dumps(value: Any) -> str:
 def main(argv: Sequence[str] | None = None) -> int:
     """Parse arguments, call the detector, and write exactly one JSON line."""
 
-    args = _build_parser().parse_args(argv)
+    selected_argv = list(sys.argv[1:] if argv is None else argv)
+    if selected_argv and selected_argv[0] in ("analyze", "monitor"):
+        from .cli import main as integration_main
+
+        return integration_main(selected_argv)
+    args = _build_parser().parse_args(selected_argv)
     try:
         output = _strict_json_dumps(run_detection(args))
         exit_code = 0
