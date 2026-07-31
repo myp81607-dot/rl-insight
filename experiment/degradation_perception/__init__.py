@@ -12,30 +12,41 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Inference-performance degradation perception."""
+"""RL-Insight degradation-perception algorithm module."""
 
 from .algorithm import DegradationPerception, build_standard_data, get_standard_data
-from .preprocessing import prometheus_query_range_to_series
-from .prometheus_query import PrometheusQueryClient
-from .rl_insight_integration import (
-    DerivedMetricPublisher,
-    MetricQuerySpec,
-    PrometheusDegradationRunner,
-    derive_detection_windows,
-    resolve_prometheus_endpoint,
+from .association_analysis import AssociationAnalyzer
+from .perception_config import (
+    DetectionInput,
+    DetectionResult,
+    MetricState,
+    ThresholdModel,
+    TimeSeries,
+)
+from .policy import (
+    DEFAULT_HISTORY_POLICY,
+    DEFAULT_METRIC_POLICY,
+    resolve_history_policy,
+    resolve_metric_policy,
 )
 from .stable_segment_detector import StableSegmentDetector
+from .timeseries import preprocess_time_series, validate_detection_input
 
 __all__ = [
+    "AssociationAnalyzer",
+    "DEFAULT_HISTORY_POLICY",
+    "DEFAULT_METRIC_POLICY",
     "DegradationPerception",
-    "DerivedMetricPublisher",
-    "MetricQuerySpec",
-    "PrometheusDegradationRunner",
-    "PrometheusQueryClient",
+    "DetectionInput",
+    "DetectionResult",
+    "MetricState",
     "StableSegmentDetector",
+    "ThresholdModel",
+    "TimeSeries",
     "build_standard_data",
-    "derive_detection_windows",
     "get_standard_data",
-    "prometheus_query_range_to_series",
-    "resolve_prometheus_endpoint",
+    "preprocess_time_series",
+    "resolve_history_policy",
+    "resolve_metric_policy",
+    "validate_detection_input",
 ]

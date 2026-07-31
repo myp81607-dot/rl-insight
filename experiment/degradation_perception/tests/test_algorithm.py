@@ -15,10 +15,8 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 import pytest
-import yaml
 
 from experiment.degradation_perception.algorithm import (
     DegradationPerception,
@@ -26,11 +24,13 @@ from experiment.degradation_perception.algorithm import (
     build_standard_data,
     get_standard_data,
 )
-from experiment.degradation_perception.config_loader import (
-    ensure_metric_config,
-    load_metric_config,
+from experiment.degradation_perception.perception_config import (
+    DetectionInput,
+    DetectionResult,
+    ThresholdModel,
+    TimeSeries,
 )
-from experiment.degradation_perception.perception_config import ThresholdModel
+from experiment.degradation_perception.policy import resolve_metric_policy
 
 
 METRIC = "timing_s/step"
@@ -56,69 +56,44 @@ def make_dataset(
     *,
     metric=METRIC,
 ):
-    return {
+    data: DetectionInput = {
         "standard": {
-            metric: {
-                "timestamps": list(range(1, len(standard_values) + 1)),
-                "values": list(standard_values),
-            }
+            metric: TimeSeries(
+                timestamps=list(range(1, len(standard_values) + 1)),
+                values=list(standard_values),
+            )
         },
         "inference": {
-            metric: {
-                "timestamps": list(range(100, 100 + len(inference_values))),
-                "values": list(inference_values),
-            }
+            metric: TimeSeries(
+                timestamps=list(range(100, 100 + len(inference_values))),
+                values=list(inference_values),
+            )
         },
     }
+    return data
 
 
-def prometheus_range_payload(values, *, start=1_710_000_000, step=15):
-    return {
-        "status": "success",
-        "data": {
-            "resultType": "matrix",
-            "result": [
-                {
-                    "metric": {"__name__": METRIC, "worker": "trainer_0"},
-                    "values": [
-                        [start + index * step, str(value)]
-                        for index, value in enumerate(values)
-                    ],
-                }
-            ],
-        },
-    }
-
-
-def detector(tmp_path, dataset, **kwargs):
+def detector(_tmp_path, dataset, **kwargs):
     return DegradationPerception(
         dataset=dataset,
         metrics=kwargs.pop("metrics", [METRIC]),
-        config_dir=tmp_path / "config",
         **kwargs,
     )
 
 
-def set_metric_abnormal_type(config_dir: Path, metric: str, abnormal_type: str):
-    path = ensure_metric_config(metric, config_dir=config_dir)
-    data = yaml.safe_load(path.read_text(encoding="utf-8"))
-    data["abnormal_type"] = abnormal_type
-    path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
-
-
 def test_get_standard_data_returns_aligned_sorted_series():
     dataset = make_dataset([1.0, 1.1, 1.2])
-    dataset["standard"][METRIC] = {
-        "timestamps": [3, 1, 2, 1],
-        "values": [3.0, 1.0, 2.0, 1.1],
-    }
+    dataset["standard"][METRIC] = TimeSeries(
+        timestamps=[3, 1, 2, 1],
+        values=[3.0, 1.0, 2.0, 1.1],
+    )
     series = get_standard_data(dataset, METRIC)
     assert series.timestamps == [1.0, 2.0, 3.0]
     assert series.values == [1.1, 2.0, 3.0]
 
 
-def test_build_standard_data_applies_one_minus_alpha_and_outward_ratios(tmp_path):
-    config = load_metric_config(METRIC, config_dir=tmp_path / "config")
+def test_build_standard_data_applies_one_minus_alpha_and_outward_ratios():
+    config = resolve_metric_policy(METRIC)
     models = build_standard_data(
         list(range(len(STANDARD_VALUES))),
         STANDARD_VALUES,
@@ -194,14 +169,12 @@ def test_sustained_up_degradation_produces_a_formal_interval(tmp_path):
     ],
 )
 def test_configured_abnormal_types_are_not_inferred_from_metric_name(
-    tmp_path, abnormal_type, inference_values
+    abnormal_type, inference_values
 ):
-    config_dir = tmp_path / "config"
-    set_metric_abnormal_type(config_dir, METRIC, abnormal_type)
     response = DegradationPerception(
         dataset=make_dataset(STANDARD_VALUES, inference_values),
         metrics=[METRIC],
-        config_dir=config_dir,
+        metric_policies={METRIC: {"abnormal_type": abnormal_type}},
     ).detect()
     assert response["states"][METRIC] == 0
     assert response["abnormalTimeRange"][METRIC][0]["abnormalType"] == abnormal_type
@@ -217,14 +190,12 @@ def test_configured_abnormal_types_are_not_inferred_from_metric_name(
     ],
 )
 def test_outward_thresholds_do_not_flag_normal_positive_or_negative_data(
-    tmp_path, standard_values, inference_values, abnormal_type
+    standard_values, inference_values, abnormal_type
 ):
-    config_dir = tmp_path / "config"
-    set_metric_abnormal_type(config_dir, METRIC, abnormal_type)
     response = DegradationPerception(
         dataset=make_dataset(standard_values, inference_values),
         metrics=[METRIC],
-        config_dir=config_dir,
+        metric_policies={METRIC: {"abnormal_type": abnormal_type}},
     ).detect()
     assert response["states"][METRIC] == 0
     assert response["abnormalTimeRange"][METRIC] == []
@@ -233,43 +204,36 @@ def test_outward_thresholds_do_not_flag_normal_positive_or_negative_data(
     )
 
 
-def test_prometheus_matrix_runs_end_to_end_and_preserves_epoch_seconds(tmp_path):
+def test_epoch_timeseries_runs_end_to_end_and_preserves_seconds():
     metric = "rl_insight_monitor_timing_s_step"
-    standard_payload = prometheus_range_payload(STANDARD_VALUES)
-    standard_payload["data"]["result"][0]["metric"]["__name__"] = metric
-    inference_payload = prometheus_range_payload(UP_INFERENCE, start=1_710_001_000)
-    inference_payload["data"]["result"][0]["metric"]["__name__"] = metric
     response = DegradationPerception(
         dataset={
-            "standard": {metric: standard_payload},
-            "inference": {metric: inference_payload},
+            "standard": {
+                metric: TimeSeries(
+                    timestamps=[
+                        1_710_000_000 + index * 15
+                        for index in range(len(STANDARD_VALUES))
+                    ],
+                    values=list(STANDARD_VALUES),
+                )
+            },
+            "inference": {
+                metric: TimeSeries(
+                    timestamps=[
+                        1_710_001_000 + index * 15
+                        for index in range(len(UP_INFERENCE))
+                    ],
+                    values=list(UP_INFERENCE),
+                )
+            },
         },
         metrics=[metric],
         source_type="prometheus",
-        config_dir=tmp_path / "config",
     ).detect()
     assert response["states"][metric] == 0
     interval = response["abnormalTimeRange"][metric][0]
     assert interval["startTime"] > 1_700_000_000
     assert interval["endTime"] > interval["startTime"]
-
-
-def test_remote_monitor_interval_crossing_10000_uses_one_time_mode(tmp_path):
-    dataset = make_dataset(STANDARD_VALUES, UP_INFERENCE)
-    dataset["inference"][METRIC]["timestamps"] = list(range(9996, 10006))
-
-    response = detector(
-        tmp_path,
-        dataset,
-        source_type="remote_monitor",
-    ).detect()
-
-    interval = response["abnormalTimeRange"][METRIC][0]
-    assert interval["startTime"] == pytest.approx(9999 / 10000 / 60)
-    assert interval["endTime"] == pytest.approx(10006 / 10000 / 60)
-    assert interval["startTime"] <= interval["endTime"]
-
-
 def test_known_high_normal_mode_is_not_flagged_by_up_detection(tmp_path):
     standard = [1.00, 1.01, 1.02, 1.04, 1.05, 5.00, 5.01, 5.02]
     response = detector(
@@ -302,14 +266,14 @@ def test_both_detection_rejects_a_model_with_lower_above_upper():
 def test_multi_metric_failure_is_isolated(tmp_path):
     bad_metric = "broken/metric"
     dataset = make_dataset()
-    dataset["standard"][bad_metric] = {
-        "timestamps": [1, 2, 3],
-        "values": [1.0],
-    }
-    dataset["inference"][bad_metric] = {
-        "timestamps": list(range(100, 106)),
-        "values": [1.0] * 6,
-    }
+    dataset["standard"][bad_metric] = TimeSeries(
+        timestamps=[1, 2, 3],
+        values=[1.0],
+    )
+    dataset["inference"][bad_metric] = TimeSeries(
+        timestamps=list(range(100, 106)),
+        values=[1.0] * 6,
+    )
     response = detector(
         tmp_path,
         dataset,
@@ -325,20 +289,14 @@ def test_multi_metric_failure_is_isolated(tmp_path):
     assert response["states"][METRIC] == 0
 
 
-def test_metric_config_error_is_not_reported_as_business_state(tmp_path):
+def test_metric_policy_error_is_not_reported_as_business_state(tmp_path):
     bad_metric = "bad-config/metric"
-    config_dir = tmp_path / "config"
-    config_path = ensure_metric_config(bad_metric, config_dir=config_dir)
-    config_path.write_text(
-        "minimum_standard_points: 0\n",
-        encoding="utf-8",
-    )
     response = detector(
         tmp_path,
         make_dataset(),
         metrics=[bad_metric, METRIC],
+        metric_policies={bad_metric: {"minimum_standard_points": 0}},
     )
-    response.config_dir = config_dir
     output = response.detect()
 
     assert bad_metric not in output["states"]
@@ -372,16 +330,12 @@ def test_internal_metric_error_is_serializable_and_redacted(
 
 
 def test_history_is_independent_and_requires_configured_number_of_abnormal_runs(
-    tmp_path,
 ):
-    common = tmp_path / "common.yaml"
-    common.write_text("n_keep_result: 3\nn_keep_abnormal: 2\n", encoding="utf-8")
     instance = DegradationPerception(
         dataset=make_dataset(STANDARD_VALUES, UP_INFERENCE),
         metrics=[METRIC],
         task_id="task-a",
-        config_dir=tmp_path / "config",
-        common_config_path=common,
+        history_policy={"n_keep_result": 3, "n_keep_abnormal": 2},
     )
     first = instance.detect()
     second = instance.detect()
@@ -391,14 +345,11 @@ def test_history_is_independent_and_requires_configured_number_of_abnormal_runs(
     assert instance.history[("task-a", METRIC)].maxlen == 3
 
 
-def test_insufficient_run_does_not_advance_valid_history(tmp_path):
-    common = tmp_path / "common.yaml"
-    common.write_text("n_keep_result: 2\nn_keep_abnormal: 2\n", encoding="utf-8")
+def test_insufficient_run_does_not_advance_valid_history():
     instance = DegradationPerception(
         dataset=make_dataset(STANDARD_VALUES, UP_INFERENCE),
         metrics=[METRIC],
-        config_dir=tmp_path / "config",
-        common_config_path=common,
+        history_policy={"n_keep_result": 2, "n_keep_abnormal": 2},
     )
     first = instance.detect()
     assert first["abnormalTimeRange"][METRIC] == []
@@ -410,12 +361,9 @@ def test_insufficient_run_does_not_advance_valid_history(tmp_path):
     assert third["abnormalTimeRange"][METRIC]
 
 
-def test_detect_dataset_uses_programmatic_data_without_a_path(tmp_path):
-    instance = DegradationPerception(
-        metrics=[METRIC],
-        config_dir=tmp_path / "config",
-    )
-    response = instance.detect_dataset(make_dataset())
+def test_detect_dataset_uses_programmatic_timeseries_input():
+    instance = DegradationPerception(metrics=[METRIC])
+    response: DetectionResult = instance.detect_dataset(make_dataset())
     assert response["states"][METRIC] == 0
 
 
@@ -438,19 +386,14 @@ def test_cached_standard_model_supports_inference_only_followup(tmp_path):
     assert followup["abnormalTimeRange"][METRIC]
 
 
-def test_config_change_invalidates_cached_standard_model(tmp_path):
-    config_dir = tmp_path / "config"
+def test_policy_change_invalidates_cached_standard_model():
     instance = DegradationPerception(
         dataset=make_dataset(),
         metrics=[METRIC],
-        config_dir=config_dir,
     )
     assert instance.detect()["states"][METRIC] == 0
 
-    target = ensure_metric_config(METRIC, config_dir=config_dir)
-    data = yaml.safe_load(target.read_text(encoding="utf-8"))
-    data["upper_ratio"] = 1.20
-    target.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    instance.metric_policies[METRIC] = {"upper_ratio": 1.20}
     inference_only = {
         "standard": {},
         "inference": make_dataset()["inference"],

@@ -65,12 +65,15 @@ def _ordered_unique_strings(values: Sequence[Any], *, name: str) -> list[str]:
 def resolve_association_config(
     metrics: Sequence[str],
     metric_configs: Mapping[str, Mapping[str, Any]],
-    cli_targets: Sequence[str] | None,
+    target_overrides: Sequence[str] | None,
 ) -> dict[str, Any] | None:
-    """Resolve CLI-over-YAML association settings after all KDE configs load."""
+    """Resolve explicit target overrides over injected metric policies."""
 
-    if cli_targets is not None:
-        targets = _ordered_unique_strings(list(cli_targets), name="association targets")
+    if target_overrides is not None:
+        targets = _ordered_unique_strings(
+            list(target_overrides),
+            name="association targets",
+        )
         target_config = metric_configs.get(targets[0], {}) if targets else {}
         raw = target_config.get("association")
         if not isinstance(raw, Mapping):

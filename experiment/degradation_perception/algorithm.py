@@ -17,34 +17,29 @@
 from __future__ import annotations
 
 import math
-import os
 from collections import deque
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
 from .association_analysis import AssociationAnalyzer, resolve_association_config
-from .config_loader import (
-    COMMON_CONFIG_PATH,
-    get_default_config_dir,
-    load_common_config,
-    load_metric_config,
-)
 from .interval_utils import build_candidate_intervals, validate_candidate_interval
 from .kde_utils import adaptive_kde, kde_quantile
 from .normalization import normalize_data
 from .perception_config import (
     DEFAULT_METRIC,
+    DetectionInput,
+    DetectionResult,
     SUPPORTED_ABNORMAL_TYPES,
     SUPPORTED_SOURCE_TYPES,
     MetricState,
     ThresholdModel,
     TimeSeries,
 )
-from .preprocessing import extract_metric_series, load_dataset
+from .policy import resolve_history_policy, resolve_metric_policy
 from .serialization import to_json_serializable
 from .stable_segment_detector import StableSegmentDetector
+from .timeseries import extract_metric_series
 from .time_utils import (
     adjust_time_bounds,
     infer_display_time_mode,
@@ -52,7 +47,7 @@ from .time_utils import (
 )
 
 
-def get_standard_data(dataset: Mapping[str, Any], metric: str) -> TimeSeries:
+def get_standard_data(dataset: DetectionInput, metric: str) -> TimeSeries:
     """Extract one aligned, finite, sorted, and deduplicated baseline series."""
 
     return extract_metric_series(dataset, "standard", metric)
@@ -243,18 +238,16 @@ class DegradationPerception:
 
     def __init__(
         self,
-        path: str | os.PathLike[str] | None = None,
         start_time: float | None = None,
         end_time: float | None = None,
         metrics: Sequence[str] | str | None = None,
         task_id: str | None = None,
         source_type: str = "training_log",
-        config_dir: str | os.PathLike[str] | None = None,
-        common_config_path: str | os.PathLike[str] | None = COMMON_CONFIG_PATH,
-        dataset: Mapping[str, Any] | None = None,
+        dataset: DetectionInput | None = None,
         association_targets: Sequence[str] | str | None = None,
+        metric_policies: Mapping[str, Mapping[str, Any]] | None = None,
+        history_policy: Mapping[str, Any] | None = None,
     ) -> None:
-        self.path = None if path is None else os.fspath(path)
         self.start_time = None if start_time is None else float(start_time)
         self.end_time = None if end_time is None else float(end_time)
         if self.start_time is not None and not math.isfinite(self.start_time):
@@ -303,21 +296,14 @@ class DegradationPerception:
 
         self.task_id = "default" if task_id is None else str(task_id)
         self.source_type = source_type
-        self.config_dir = Path(
-            get_default_config_dir() if config_dir is None else config_dir
-        )
-        self.common_config_path = Path(
-            COMMON_CONFIG_PATH
-            if common_config_path is None
-            else common_config_path
-        )
         self.dataset = dataset
+        self.metric_policies = dict(metric_policies or {})
         self.states: dict[str, int] = {}
         self.config_dict: dict[str, dict[str, Any]] = {}
         self.history: dict[tuple[str, str], deque[dict[str, Any]]] = {}
         self.standard_models: dict[str, list[ThresholdModel]] = {}
         self._standard_model_configs: dict[str, dict[str, Any]] = {}
-        self.common_config = load_common_config(self.common_config_path)
+        self.common_config = resolve_history_policy(history_policy)
         self._validate_history_config()
 
     def _validate_history_config(self) -> None:
@@ -336,7 +322,7 @@ class DegradationPerception:
         self.n_keep_abnormal = n_keep_abnormal
 
     def get_standard_data(
-        self, dataset: Mapping[str, Any], metric: str
+        self, dataset: DetectionInput, metric: str
     ) -> TimeSeries:
         """Programmatic counterpart of the required get_standard_data step."""
 
@@ -352,20 +338,12 @@ class DegradationPerception:
 
         return build_standard_data(timestamps, values, config)
 
-    def detect(self) -> dict[str, Any]:
-        """Load the configured source, detect every metric, and return JSON data."""
+    def detect(self) -> DetectionResult:
+        """Detect the in-memory dataset supplied at construction time."""
 
-        if self.dataset is not None:
-            dataset = self.dataset
-        elif self.path is not None:
-            dataset = load_dataset(
-                self.path,
-                self.metrics,
-                start_time=self.start_time,
-                end_time=self.end_time,
-            )
-        else:
-            raise ValueError("either path or dataset must be provided")
+        if self.dataset is None:
+            raise ValueError("dataset must be provided or passed to detect_dataset")
+        dataset = self.dataset
         return self._detect_loaded_dataset(
             dataset,
             metrics=self.metrics,
@@ -375,13 +353,13 @@ class DegradationPerception:
 
     def detect_dataset(
         self,
-        dataset: Mapping[str, Any],
+        dataset: DetectionInput,
         *,
         metrics: Sequence[str] | str | None = None,
         start_time: float | None = None,
         end_time: float | None = None,
-    ) -> dict[str, Any]:
-        """Detect an already fetched dataset without invoking the CLI entry point."""
+    ) -> DetectionResult:
+        """Detect standardized in-memory TimeSeries supplied by RL-Insight."""
 
         if not isinstance(dataset, Mapping):
             raise TypeError("dataset must be a mapping")
@@ -417,12 +395,12 @@ class DegradationPerception:
 
     def _detect_loaded_dataset(
         self,
-        dataset: Mapping[str, Any],
+        dataset: DetectionInput,
         *,
         metrics: Sequence[str],
         start_time: float | None,
         end_time: float | None,
-    ) -> dict[str, Any]:
+    ) -> DetectionResult:
         states: dict[str, int] = {}
         results: dict[str, dict[str, Any]] = {}
         confirmed_ranges: dict[str, list[dict[str, Any]]] = {}
@@ -433,7 +411,10 @@ class DegradationPerception:
         for metric in metrics:
             error_stage = "configuration"
             try:
-                config = load_metric_config(metric, config_dir=self.config_dir)
+                config = resolve_metric_policy(
+                    metric,
+                    self.metric_policies.get(metric),
+                )
                 self.config_dict[metric] = config
                 metric_configs[metric] = config
                 abnormal_type = str(config.get("abnormal_type", "UP")).upper()
@@ -604,7 +585,7 @@ class DegradationPerception:
         for metric in metric_errors:
             self.states.pop(metric, None)
         self.states.update(states)
-        response = {
+        response: DetectionResult = {
             "taskId": self.task_id,
             "states": states,
             "results": results,

@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import copy
+import importlib.util
 import math
 
 import pytest
@@ -29,6 +30,12 @@ from experiment.degradation_perception.association_analysis import (
 )
 from experiment.degradation_perception.perception_config import TimeSeries
 from experiment.degradation_perception.time_alignment import AlignmentResult
+
+
+requires_sklearn = pytest.mark.skipif(
+    importlib.util.find_spec("sklearn") is None,
+    reason="scikit-learn is an optional association dependency",
+)
 
 
 def test_strong_positive_linear_correlation_prefers_pearson_on_numeric_tie():
@@ -223,12 +230,12 @@ def test_evidence_normalizes_over_every_candidate_before_top_k(candidate_count):
     ) == pytest.approx(1.0)
 
 
-def test_disabled_yaml_does_not_request_association_analysis():
+def test_disabled_policy_does_not_request_association_analysis():
     configs = {"target": {"association": copy.deepcopy(DEFAULT_ASSOCIATION_CONFIG)}}
     assert resolve_association_config(["target"], configs, None) is None
 
 
-def test_enabled_yaml_and_cli_override_resolve_explicit_targets():
+def test_enabled_policy_and_target_override_resolve_explicit_targets():
     configured = copy.deepcopy(DEFAULT_ASSOCIATION_CONFIG)
     configured["enabled"] = True
     configured["target_metrics"] = ["configured"]
@@ -236,13 +243,13 @@ def test_enabled_yaml_and_cli_override_resolve_explicit_targets():
     assert resolve_association_config(["configured"], configs, None)[
         "target_metrics"
     ] == ["configured"]
-    cli = resolve_association_config(
+    overridden = resolve_association_config(
         ["configured"],
         configs,
-        ["cli", "cli", "other"],
+        ["caller", "caller", "other"],
     )
-    assert cli["enabled"] is True
-    assert cli["target_metrics"] == ["cli", "other"]
+    assert overridden["enabled"] is True
+    assert overridden["target_metrics"] == ["caller", "other"]
 
 
 def _alignment(
@@ -273,6 +280,7 @@ def _rf_config(*, min_samples=20):
     return config
 
 
+@requires_sklearn
 def test_random_forest_strong_feature_ranks_above_weaker_feature():
     target = [bool(index % 4 >= 2) for index in range(80)]
     strong = list(target)
@@ -294,6 +302,7 @@ def test_random_forest_strong_feature_ranks_above_weaker_feature():
     )
 
 
+@requires_sklearn
 def test_random_forest_handles_class_imbalance_with_balanced_configuration():
     target = [bool(index % 10 == 0) for index in range(100)]
     result = _random_forest_importances(
@@ -334,6 +343,7 @@ def test_random_forest_all_constant_features_degrade_safely():
     assert result["reason"] == "all_candidate_features_constant"
 
 
+@requires_sklearn
 def test_random_forest_time_split_single_class_uses_explicit_impurity_fallback():
     target = [False] * 30 + [True] * 10
     result = _random_forest_importances(
@@ -345,6 +355,7 @@ def test_random_forest_time_split_single_class_uses_explicit_impurity_fallback()
     assert result["reason"] == "time_split_lacks_both_classes"
 
 
+@requires_sklearn
 def test_random_forest_fixed_seed_is_repeatable():
     target = [bool(index % 4 >= 2) for index in range(80)]
     alignments = {
@@ -359,6 +370,7 @@ def test_random_forest_fixed_seed_is_repeatable():
     assert first["rawImportances"] == pytest.approx(second["rawImportances"])
 
 
+@requires_sklearn
 def test_random_forest_permutation_failure_has_specific_diagnostic(monkeypatch):
     import sklearn.inspection
 

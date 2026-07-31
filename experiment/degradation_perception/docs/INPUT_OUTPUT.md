@@ -1,131 +1,114 @@
-# Degradation Input and Output
+# Input and Output Contract
 
-## Production input
+The public algorithm boundary contains only in-memory time series, policies and
+structured results. Data acquisition, transport conversion and result storage
+belong to the caller.
 
-Production analysis receives business parameters through
-`rl-insight degradation analyze/monitor` semantics:
+## TimeSeries
 
-- RL-Insight task identity: `project`, `experiment_name`, optional `worker` and
-  `replica`;
-- one or more logical-to-Prometheus metric mappings;
-- optional advanced PromQL templates;
-- optional explicit standard/inference time boundaries;
-- independent degradation algorithm configuration.
+`TimeSeries` represents one scalar metric:
 
-The production path does not accept or require a workflow YAML and does not
-contain a required Prometheus URL. The managed Prometheus query endpoint is
-resolved through RL-Insight Server service discovery.
-
-`--prometheus-url` is a development/test override only.
-
-## Window input
-
-The window source order is:
-
-```text
-explicit CLI/API boundaries
-> task metadata start time plus current detection time
-> baseline/inference duration defaults
+```python
+TimeSeries(
+    timestamps=[1.0, 2.0, 3.0],
+    values=[10.0, 10.1, 9.9],
+)
 ```
 
-The defaults are 1800 seconds for each window. Explicit boundaries accept Unix
-epoch seconds or ISO-8601 text.
+Contract rules:
 
-The current RL-Insight Server exposes service information but no public task
-metadata endpoint. Programmatic callers may provide
-`task_metadata={"start_time": ...}` and CLI callers may use `--task-start`.
-The integration never reads private Server runtime files.
+- `timestamps` and `values` are aligned and have equal lengths;
+- timestamps and values are numeric; booleans are not accepted as numbers;
+- non-finite or invalid pairs are removed together;
+- valid pairs are sorted by timestamp;
+- duplicate timestamps keep the last valid value from the original input;
+- timestamp units must be consistent within an analysis request.
 
-## Prometheus query contract
+The detector validates and normalizes the sequence defensively, but callers
+should construct canonical `TimeSeries` objects before invoking it.
 
-Every query uses `/api/v1/query_range` and must return:
+## DetectionInput
 
-```json
-{
-  "status": "success",
-  "data": {
-    "resultType": "matrix",
-    "result": [
-      {
-        "metric": {
-          "__name__": "rl_insight_monitor_timing_s_step",
-          "project": "verl",
-          "experiment_name": "run-a",
-          "worker": "trainer_0"
-        },
-        "values": [
-          [1710000000, "1.0"],
-          [1710000010, "1.1"]
-        ]
-      }
-    ]
-  }
+`DetectionInput` explicitly separates healthy baseline data from the window to
+be analyzed:
+
+```python
+data: DetectionInput = {
+    'standard': {
+        'timing_s/step': TimeSeries(
+            timestamps=[1.0, 2.0, 3.0],
+            values=[1.00, 1.01, 0.99],
+        ),
+        'gpu_utilization': TimeSeries(
+            timestamps=[1.0, 2.0, 3.0],
+            values=[40.0, 41.0, 39.0],
+        ),
+    },
+    'inference': {
+        'timing_s/step': TimeSeries(
+            timestamps=[10.0, 11.0, 12.0],
+            values=[1.00, 1.50, 1.60],
+        ),
+        'gpu_utilization': TimeSeries(
+            timestamps=[10.0, 11.0, 12.0],
+            values=[42.0, 88.0, 92.0],
+        ),
+    },
 }
 ```
 
-The final query must identify exactly one scalar series. Native histogram-only
-responses are rejected. Counter and histogram metrics must be converted to a
-scalar with PromQL.
+`standard` is used to identify stable health modes and build KDE models.
+`inference` is classified against those models. Phase membership is always
+explicit and is never inferred from a source name or timestamp.
 
-`MetricQuerySpec` supports `{{metric}}` and `{{labels}}` placeholders so one
-query template can reuse RL-Insight task labels for both phases.
+`metric_policies` may override any selected metric; omitted metrics use the
+module's unchanged default policy. Association targets and candidates must be
+present in the selected metric set. Policies are plain in-memory mappings
+supplied by the caller.
 
-## Internal algorithm input
+## DetectionResult
 
-After strict matrix conversion, the unchanged detector receives:
+`detect()` and `detect_dataset()` return a `DetectionResult`. It is a
+JSON-compatible structure; returning it does not write files or publish data.
 
-```json
-{
-  "standard": {
-    "timing_s/step": {
-      "timestamps": [1710000000, 1710000010],
-      "values": [1.0, 1.1]
-    }
-  },
-  "inference": {
-    "timing_s/step": {
-      "timestamps": [1710001800, 1710001810],
-      "values": [1.3, 1.4]
-    }
-  }
-}
-```
+Top-level fields:
 
-Phase membership is explicit; it is never inferred from filenames.
+- `taskId`: caller-provided analysis identity;
+- `states`: numeric state for each successfully evaluated metric;
+- `results`: per-metric thresholds, point diagnostics and interval details;
+- `abnormalTimeRange`: confirmed intervals grouped by metric;
+- `metricErrors`: optional isolated input, policy or detection errors;
+- `associationAnalysis`: optional event-level association ranking.
 
-The existing offline `main --path` contract remains available for tests and
-local data. It accepts UTF-8 JSON whose root contains exactly `standard` and
-`inference`. Each metric is either canonical `timestamps`/`values` data or one
-already-fetched single-series Prometheus matrix.
-
-## JSON output
-
-`analyze` prints one complete, strict JSON-serializable `DetectionResponse`.
-`monitor` prints one response per run as JSON Lines. The response includes:
-
-- `taskId`;
-- per-metric `states`;
-- detailed `results`, including thresholds, point diagnostics and
-  `abnormalTimeRange`;
-- top-level `abnormalTimeRange`;
-- isolated `metricErrors`;
-- optional `associationAnalysis`.
-
-When `--output-dir` is set, the latest run is also stored as:
+Metric states are:
 
 ```text
-detection_response.json
-query_diagnostics.json
+0  detection completed
+1  healthy standard data is insufficient
+2  inference data is insufficient
 ```
 
-## Prometheus output
+A completed state does not by itself mean that degradation exists. Callers
+must inspect the metric's `abnormalTimeRange`.
 
-`monitor` exposes low-cardinality derived gauges through a persistent
-`/metrics` endpoint and registers that endpoint using the existing RL-Insight
-scrape target API.
+Each formal abnormal interval contains:
 
-Prometheus receives status, threshold envelopes, abnormal rate/count, latest
-detection timestamp, interval-active state and bounded association Top-K.
+- `startTime` and `endTime`: published interval boundaries;
+- `duration`: duration before display-boundary padding;
+- `totalPointCount` and `abnormalPointCount`;
+- `abnormalRate`;
+- `abnormalType`: `UP`, `DOWN` or `BOTH`;
+- `validationDetail` and `maximumAllowedGap`.
 
-Complete intervals and complex diagnostics remain JSON-only. Query strings,
-timestamps and interval payloads are never Prometheus labels.
+`results[metric].currentAbnormalTimeRange` contains intervals found in the
+current batch. `results[metric].abnormalTimeRange` contains intervals that also
+passed history confirmation. The top-level `abnormalTimeRange` mirrors the
+confirmed intervals for convenient consumption.
+
+Thresholds and point diagnostics remain metric-local. Failure of one metric is
+reported through `metricErrors` and does not invalidate completed results for
+other metrics. Association analysis is optional post-processing; its failure
+does not rewrite KDE states or intervals.
+
+For the algorithm behind these fields, see [Algorithm](ALGORITHM.md). For the
+association result schema, see [Association Analysis](ASSOCIATION_ANALYSIS.md).
