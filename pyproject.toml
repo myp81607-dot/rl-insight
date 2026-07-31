@@ -37,7 +37,7 @@ recipe = [
 degradation = [
   "numpy",
   "scipy",
-  "paramiko",
+  "scikit-learn>=1.5,<2",
 ]
 test = [
   "pytest",
@@ -46,7 +46,6 @@ test = [
 [project.scripts]
 rl-insight = "rl_insight.cli:main"
 rl-insight-recipe = "recipe:main"
-rl-insight-degradation = "experiment.degradation_perception.main:main"
 
 [project.urls]
 Homepage = "https://github.com/verl-project/rl-insight"
@@ -86,11 +85,6 @@ rl_insight = [
 recipe = [
   "config/*.yaml",
   "config/*.yml",
-]
-"experiment.degradation_perception" = [
-  "*.yaml",
-  "*.yml",
-  "sample_data.json",
 ]
 
 [tool.pytest.ini_options]

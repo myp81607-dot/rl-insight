@@ -1,7 +1,7 @@
 # Algorithm
 
-This document describes the detailed detection flow. For installation and the
-test closure, start with the [module README](../README.md).
+This document describes the algorithm behind the in-memory detection API. For
+the module boundary and a minimal call, start with the [module README](../README.md).
 
 ## Detection Flow
 
@@ -109,7 +109,7 @@ condition_3: abnormal rate >= minimum_abnormal_rate
 condition_4: every adjacent timestamp gap is within the continuity limit
 ```
 
-The bundled defaults are:
+The default interval policy is:
 
 ```text
 minimum_duration:        0.5
@@ -120,29 +120,30 @@ minimum_abnormal_rate:   0.60
 The default continuity limit is three times the median positive sample gap.
 `maximum_time_gap` can override it.
 
-Output boundaries are padded only after these checks. See
-[Duration and Display Boundaries](INPUT_OUTPUT.md#duration-and-display-boundaries)
-for the exact field semantics.
+Output boundaries are padded only after these checks. See the
+[DetectionResult contract](INPUT_OUTPUT.md#detectionresult) for the exact field
+semantics.
 
 ## History and Threshold Cache
 
 History is keyed by `(task_id, metric)`. Only successful state-`0` detections
 enter the bounded history queue. Threshold models are cached after a valid
-standard window so later remote inference-only batches can reuse them.
+standard window so later inference-only batches can reuse them.
 
-Both stores are process-local. A one-shot CLI invocation starts a new process,
-and a remote monitor restart requires standard data again.
+Both stores belong to the detector instance. Callers that require confirmation
+across batches must keep that instance alive; a new instance needs healthy
+standard data before it can rebuild the cache.
 
-## Configuration Reference
+## Injected Policies
 
-The complete template is
-[`default_config.yaml`](../default_config.yaml). It contains:
+The caller supplies algorithm policies as in-memory mappings:
 
-- metric direction, KDE tail probability, and threshold expansion ratios;
-- minimum standard and inference point counts;
-- normalization and KDE settings;
-- stable-segment voting and continuity settings;
-- abnormal-interval validation and continuity settings.
+- `metric_policies` defines metric direction, KDE tail probability, threshold
+  expansion, minimum point counts, normalization, stable-segment voting and
+  abnormal-interval rules;
+- `history_policy` defines the bounded confirmation queue;
+- `association_targets` explicitly selects target metrics for optional
+  association analysis.
 
-Per-metric settings are loaded on each detection call. History confirmation is
-configured separately in [`common_config.yaml`](../common_config.yaml).
+The detector validates these policies but does not locate or read configuration
+files. Policy storage and business-level defaults belong to the caller.

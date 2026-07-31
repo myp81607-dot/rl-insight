@@ -12,72 +12,68 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Safe YAML configuration loading and per-metric template creation."""
+"""Pure in-memory policies for degradation perception.
+
+The caller owns configuration loading and storage. This module owns the
+algorithm defaults, deep merging, and strict validation of supplied values.
+"""
 
 from __future__ import annotations
 
 import copy
-import hashlib
 import math
-import ntpath
-import os
-import posixpath
-import re
-import shutil
-import tempfile
 from collections.abc import Mapping
-from pathlib import Path
 from typing import Any
 
-import yaml
+from .association_analysis import DEFAULT_ASSOCIATION_CONFIG
 
 
-def get_default_config_dir(
-    *,
-    platform: str | None = None,
-    environ: Mapping[str, str] | None = None,
-    home: str | os.PathLike[str] | None = None,
-) -> Path:
-    """Return a conventional per-user writable configuration directory."""
-
-    selected_platform = os.name if platform is None else platform
-    selected_environ = os.environ if environ is None else environ
-    selected_home = Path.home() if home is None else Path(home)
-    if selected_platform == "nt":
-        appdata = selected_environ.get("APPDATA") or selected_environ.get(
-            "LOCALAPPDATA"
-        )
-        base = (
-            Path(appdata).expanduser()
-            if appdata
-            else selected_home / "AppData" / "Roaming"
-        )
-    else:
-        xdg_config_home = selected_environ.get("XDG_CONFIG_HOME")
-        base = (
-            Path(xdg_config_home).expanduser()
-            if xdg_config_home
-            else selected_home / ".config"
-        )
-    return base / "rl-insight" / "degradation-perception"
-
-
-MODULE_DIR = Path(__file__).resolve().parent
-DEFAULT_CONFIG_PATH = MODULE_DIR / "default_config.yaml"
-COMMON_CONFIG_PATH = MODULE_DIR / "common_config.yaml"
-DEFAULT_CONFIG_DIR = get_default_config_dir()
-_MAX_CONFIG_BYTES = 1024 * 1024
-_MAX_FILENAME_STEM_LENGTH = 160
-_WINDOWS_RESERVED_NAMES = {
-    "CON",
-    "PRN",
-    "AUX",
-    "NUL",
-    *(f"COM{index}" for index in range(1, 10)),
-    *(f"LPT{index}" for index in range(1, 10)),
+DEFAULT_METRIC_POLICY: dict[str, Any] = {
+    "metric": "",
+    "abnormal_type": "UP",
+    "alpha": 0.01,
+    "upper_ratio": 1.15,
+    "lower_ratio": 1.15,
+    "minimum_standard_points": 3,
+    "minimum_inference_points": 5,
+    "normalization": {
+        "type": "identity",
+    },
+    "kde": {
+        "kernel": "gaussian",
+        "bandwidth": "auto",
+        "grid_size": 1024,
+        "padding_ratio": 0.10,
+        "tail_bandwidths": 6.0,
+        "zero_range_epsilon": 1.0e-8,
+        "random_seed": 42,
+        "peak_prominence_ratio": 0.01,
+    },
+    "stable_segment": {
+        "std_factor": 2.0,
+        "within_std_coefficient": 1.05,
+        "minimum_passed_flags": 4,
+        "mean_tolerance_ratio": 0.02,
+        "time_gap_factor": 3.0,
+        "maximum_time_gap": None,
+    },
+    "abnormal_interval": {
+        "minimum_duration": 0.5,
+        "minimum_abnormal_points": 5,
+        "minimum_abnormal_rate": 0.60,
+        "max_normal_points_between": 1,
+        "time_gap_factor": 3.0,
+        "maximum_time_gap": None,
+    },
+    "association": copy.deepcopy(DEFAULT_ASSOCIATION_CONFIG),
 }
 
-_METRIC_CONFIG_KEYS = {
+DEFAULT_HISTORY_POLICY: dict[str, int] = {
+    "n_keep_result": 1,
+    "n_keep_abnormal": 1,
+}
+
+_METRIC_POLICY_KEYS = {
     "metric",
     "abnormal_type",
     "alpha",
@@ -138,243 +134,67 @@ _ASSOCIATION_RANDOM_FOREST_KEYS = {
     "random_state",
     "importance_method",
 }
-_COMMON_CONFIG_KEYS = {"n_keep_result", "n_keep_abnormal"}
+_HISTORY_POLICY_KEYS = {"n_keep_result", "n_keep_abnormal"}
 
 
-class ConfigCollisionError(ValueError):
-    """A safe filename already belongs to a different raw metric name."""
-
-
-def metric_to_safe_filename(metric: str) -> str:
-    """Convert an arbitrary metric name to one non-traversing YAML filename."""
+def resolve_metric_policy(
+    metric: str,
+    override: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return a validated policy without reading or writing configuration files."""
 
     if not isinstance(metric, str) or not metric.strip():
         raise ValueError("metric must be a non-empty string")
-    if metric != metric.strip():
-        raise ValueError("metric must not have leading or trailing whitespace")
-    if any(ord(character) < 32 or ord(character) == 127 for character in metric):
-        raise ValueError("metric must not contain control characters")
-    if (
-        posixpath.isabs(metric)
-        or ntpath.isabs(metric)
-        or bool(ntpath.splitdrive(metric)[0])
-    ):
-        raise ValueError("metric must not be an absolute path or contain a drive")
-    components = re.split(r"[\\/]", metric)
-    if any(component in {"", ".", ".."} for component in components):
-        raise ValueError("metric contains an unsafe path component")
-
-    safe = metric.replace("/", "__").replace("\\", "__")
-    while ".." in safe:
-        safe = safe.replace("..", "__")
-    safe = re.sub(r'[<>:"|?*]', "_", safe)
-    safe = re.sub(r"[^0-9A-Za-z_.-]+", "_", safe)
-    safe = safe.strip(" .")
-    if not safe:
-        raise ValueError("metric does not contain a safe filename component")
-    if safe.split(".", 1)[0].upper() in _WINDOWS_RESERVED_NAMES:
-        safe = f"_{safe}"
-    if len(safe) > _MAX_FILENAME_STEM_LENGTH:
-        digest = hashlib.sha256(metric.encode("utf-8")).hexdigest()[:16]
-        prefix_length = _MAX_FILENAME_STEM_LENGTH - len(digest) - 2
-        safe = f"{safe[:prefix_length]}__{digest}"
-    return f"{safe}.yaml"
+    supplied = {} if override is None else dict(override)
+    resolved = _deep_merge(DEFAULT_METRIC_POLICY, supplied)
+    if supplied.get("metric") in (None, ""):
+        resolved["metric"] = metric
+    validate_metric_policy(resolved, metric)
+    return resolved
 
 
-def _safe_target(config_dir: str | os.PathLike[str], metric: str) -> Path:
-    base = Path(config_dir).expanduser().resolve()
-    target = (base / metric_to_safe_filename(metric)).resolve()
-    try:
-        target.relative_to(base)
-    except ValueError as exc:
-        raise ValueError("metric configuration path escapes config_dir") from exc
-    return target
+def resolve_history_policy(
+    override: Mapping[str, Any] | None = None,
+) -> dict[str, int]:
+    """Return validated process-local history settings."""
 
-
-def ensure_metric_config(
-    metric: str,
-    *,
-    config_dir: str | os.PathLike[str] | None = None,
-    default_config_path: str | os.PathLike[str] = DEFAULT_CONFIG_PATH,
-) -> Path:
-    """Copy the complete default template once and bind it to ``metric``.
-
-    Existing files are never modified. Their embedded raw metric name is used
-    to detect collisions caused by filename sanitization.
-    """
-
-    template = Path(default_config_path).expanduser().resolve()
-    if not template.is_file():
-        raise FileNotFoundError(f"Default metric config not found: {template}")
-    selected_config_dir = (
-        get_default_config_dir() if config_dir is None else config_dir
-    )
-    target = _safe_target(selected_config_dir, metric)
-    if target.exists():
-        if not target.is_file():
-            raise OSError(f"Metric config path is not a file: {target}")
-        _verify_metric_binding(target, metric)
-        return target
-    try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        raise OSError(
-            f"Failed to create metric config directory {target.parent}: {exc}"
-        ) from exc
-
-    # Reserve the target exclusively before copyfile. This closes the
-    # exists/copy race without ever overwriting a concurrently created config.
-    try:
-        with target.open("xb"):
-            pass
-    except FileExistsError:
-        if not target.is_file():
-            raise OSError(f"Metric config path is not a file: {target}")
-        _verify_metric_binding(target, metric)
-        return target
-    try:
-        shutil.copyfile(template, target)
-        raw = _read_yaml(target)
-        raw["metric"] = metric
-        _write_yaml_atomic(target, raw)
-    except OSError as exc:
-        try:
-            target.unlink()
-        except OSError:
-            pass
-        raise OSError(f"Failed to copy metric config to {target}: {exc}") from exc
-    except Exception:
-        try:
-            target.unlink()
-        except OSError:
-            pass
-        raise
-    return target
-
-
-def _read_yaml(path: Path) -> dict[str, Any]:
-    try:
-        if not path.is_file():
-            raise FileNotFoundError(f"Config file not found: {path}")
-        if path.stat().st_size > _MAX_CONFIG_BYTES:
-            raise ValueError(
-                f"YAML config exceeds {_MAX_CONFIG_BYTES} bytes: {path}"
-            )
-        loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    except ValueError:
-        raise
-    except (OSError, UnicodeError, yaml.YAMLError) as exc:
-        raise ValueError(f"Failed to load YAML config {path}: {exc}") from exc
-    if not isinstance(loaded, Mapping):
-        raise ValueError(f"YAML config must contain an object: {path}")
-    return dict(loaded)
-
-
-def _write_yaml_atomic(path: Path, data: Mapping[str, Any]) -> None:
-    """Atomically write one small YAML mapping beside its destination."""
-
-    temporary_name: str | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=str(path.parent),
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as stream:
-            temporary_name = stream.name
-            yaml.safe_dump(
-                dict(data),
-                stream,
-                allow_unicode=True,
-                sort_keys=False,
-            )
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary_name, path)
-        temporary_name = None
-    finally:
-        if temporary_name is not None:
-            try:
-                os.unlink(temporary_name)
-            except OSError:
-                pass
-
-
-def _verify_metric_binding(path: Path, metric: str) -> None:
-    raw_metric = _read_yaml(path).get("metric")
-    if raw_metric != metric:
-        if raw_metric is None or raw_metric == "":
-            detail = "does not contain its original metric name"
-        else:
-            detail = f"is already bound to metric {raw_metric!r}"
-        raise ConfigCollisionError(
-            f"Metric config {path} {detail}; requested metric is {metric!r}"
-        )
-
-
-def _deep_merge(base: dict[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
-    merged = copy.deepcopy(base)
-    for key, value in override.items():
-        if (
-            isinstance(value, Mapping)
-            and isinstance(merged.get(key), Mapping)
-        ):
-            merged[key] = _deep_merge(dict(merged[key]), value)
-        else:
-            merged[key] = copy.deepcopy(value)
-    return merged
-
-
-def load_metric_config(
-    metric: str,
-    *,
-    config_dir: str | os.PathLike[str] | None = None,
-    default_config_path: str | os.PathLike[str] = DEFAULT_CONFIG_PATH,
-) -> dict[str, Any]:
-    """Explicitly initialize and load one per-metric YAML config."""
-
-    target = ensure_metric_config(
-        metric,
-        config_dir=config_dir,
-        default_config_path=default_config_path,
-    )
-    defaults = _read_yaml(Path(default_config_path).expanduser().resolve())
-    config = _deep_merge(defaults, _read_yaml(target))
-    _validate_metric_config(config, metric)
-    return config
-
-
-def load_common_config(
-    path: str | os.PathLike[str] = COMMON_CONFIG_PATH,
-) -> dict[str, Any]:
-    """Load history aggregation settings."""
-
-    config = _read_yaml(Path(path).expanduser().resolve())
-    _reject_unknown_keys(config, _COMMON_CONFIG_KEYS, "common config")
+    supplied = {} if override is None else dict(override)
+    resolved = _deep_merge(DEFAULT_HISTORY_POLICY, supplied)
+    _reject_unknown_keys(resolved, _HISTORY_POLICY_KEYS, "history policy")
     n_keep_result = _require_integer(
-        config, "n_keep_result", minimum=1, context="common config"
+        resolved,
+        "n_keep_result",
+        minimum=1,
+        context="history policy",
     )
     n_keep_abnormal = _require_integer(
-        config, "n_keep_abnormal", minimum=1, context="common config"
+        resolved,
+        "n_keep_abnormal",
+        minimum=1,
+        context="history policy",
     )
     if n_keep_abnormal > n_keep_result:
         raise ValueError(
-            "common config n_keep_abnormal must not exceed n_keep_result"
+            "history policy n_keep_abnormal must not exceed n_keep_result"
         )
-    return config
+    return {
+        "n_keep_result": n_keep_result,
+        "n_keep_abnormal": n_keep_abnormal,
+    }
 
 
-def _validate_metric_config(config: Mapping[str, Any], metric: str) -> None:
-    _reject_unknown_keys(config, _METRIC_CONFIG_KEYS, "metric config")
+def validate_metric_policy(config: Mapping[str, Any], metric: str) -> None:
+    """Validate one fully resolved per-metric algorithm policy."""
+
+    _reject_unknown_keys(config, _METRIC_POLICY_KEYS, "metric policy")
     if config.get("metric") != metric:
-        raise ConfigCollisionError(
-            f"metric config is bound to {config.get('metric')!r}, expected {metric!r}"
+        raise ValueError(
+            f"metric policy is bound to {config.get('metric')!r}, "
+            f"expected {metric!r}"
         )
     abnormal_type = config.get("abnormal_type")
     if abnormal_type not in {"UP", "DOWN", "BOTH"}:
-        raise ValueError("metric config abnormal_type must be UP, DOWN, or BOTH")
+        raise ValueError("metric policy abnormal_type must be UP, DOWN, or BOTH")
     _require_number(
         config,
         "alpha",
@@ -382,39 +202,39 @@ def _validate_metric_config(config: Mapping[str, Any], metric: str) -> None:
         maximum=0.5,
         minimum_inclusive=False,
         maximum_inclusive=False,
-        context="metric config",
+        context="metric policy",
     )
     _require_number(
         config,
         "upper_ratio",
         minimum=1.0,
-        context="metric config",
+        context="metric policy",
     )
     _require_number(
         config,
         "lower_ratio",
         minimum=1.0,
-        context="metric config",
+        context="metric policy",
     )
     _require_integer(
         config,
         "minimum_standard_points",
         minimum=3,
-        context="metric config",
+        context="metric policy",
     )
     _require_integer(
         config,
         "minimum_inference_points",
         minimum=1,
-        context="metric config",
+        context="metric policy",
     )
 
-    normalization = _require_mapping(config, "normalization", "metric config")
+    normalization = _require_mapping(config, "normalization", "metric policy")
     _reject_unknown_keys(normalization, _NORMALIZATION_KEYS, "normalization")
     if normalization.get("type") != "identity":
         raise ValueError("normalization.type must be identity")
 
-    kde = _require_mapping(config, "kde", "metric config")
+    kde = _require_mapping(config, "kde", "metric policy")
     _reject_unknown_keys(kde, _KDE_KEYS, "kde")
     if kde.get("kernel") != "gaussian":
         raise ValueError("kde.kernel must be gaussian")
@@ -445,7 +265,7 @@ def _validate_metric_config(config: Mapping[str, Any], metric: str) -> None:
     _require_integer(kde, "random_seed", minimum=0, context="kde")
     _require_number(kde, "peak_prominence_ratio", minimum=0.0, context="kde")
 
-    stable = _require_mapping(config, "stable_segment", "metric config")
+    stable = _require_mapping(config, "stable_segment", "metric policy")
     _reject_unknown_keys(stable, _STABLE_SEGMENT_KEYS, "stable_segment")
     _require_number(
         stable,
@@ -483,10 +303,11 @@ def _validate_metric_config(config: Mapping[str, Any], metric: str) -> None:
         context="stable_segment",
     )
     _require_optional_positive_number(
-        stable.get("maximum_time_gap"), "stable_segment.maximum_time_gap"
+        stable.get("maximum_time_gap"),
+        "stable_segment.maximum_time_gap",
     )
 
-    interval = _require_mapping(config, "abnormal_interval", "metric config")
+    interval = _require_mapping(config, "abnormal_interval", "metric policy")
     _reject_unknown_keys(interval, _ABNORMAL_INTERVAL_KEYS, "abnormal_interval")
     _require_number(
         interval,
@@ -521,10 +342,11 @@ def _validate_metric_config(config: Mapping[str, Any], metric: str) -> None:
         context="abnormal_interval",
     )
     _require_optional_positive_number(
-        interval.get("maximum_time_gap"), "abnormal_interval.maximum_time_gap"
+        interval.get("maximum_time_gap"),
+        "abnormal_interval.maximum_time_gap",
     )
 
-    association = _require_mapping(config, "association", "metric config")
+    association = _require_mapping(config, "association", "metric policy")
     _reject_unknown_keys(association, _ASSOCIATION_KEYS, "association")
     if not isinstance(association.get("enabled"), bool):
         raise ValueError("association.enabled must be a boolean")
@@ -545,7 +367,9 @@ def _validate_metric_config(config: Mapping[str, Any], metric: str) -> None:
 
     weights = _require_mapping(association, "weights", "association")
     _reject_unknown_keys(
-        weights, _ASSOCIATION_WEIGHT_KEYS, "association.weights"
+        weights,
+        _ASSOCIATION_WEIGHT_KEYS,
+        "association.weights",
     )
     correlation_weight = _require_number(
         weights,
@@ -567,11 +391,12 @@ def _validate_metric_config(config: Mapping[str, Any], metric: str) -> None:
     ):
         raise ValueError("association weights must sum to 1")
 
-    _require_integer(
-        association, "top_k", minimum=1, context="association"
-    )
+    _require_integer(association, "top_k", minimum=1, context="association")
     _require_number(
-        association, "context_ratio", minimum=0.0, context="association"
+        association,
+        "context_ratio",
+        minimum=0.0,
+        context="association",
     )
     _require_integer(
         association,
@@ -580,7 +405,10 @@ def _validate_metric_config(config: Mapping[str, Any], metric: str) -> None:
         context="association",
     )
     _require_integer(
-        association, "min_rf_samples", minimum=1, context="association"
+        association,
+        "min_rf_samples",
+        minimum=1,
+        context="association",
     )
     _require_number(
         association,
@@ -595,7 +423,9 @@ def _validate_metric_config(config: Mapping[str, Any], metric: str) -> None:
     )
 
     random_forest = _require_mapping(
-        association, "random_forest", "association"
+        association,
+        "random_forest",
+        "association",
     )
     _reject_unknown_keys(
         random_forest,
@@ -624,8 +454,23 @@ def _validate_metric_config(config: Mapping[str, Any], metric: str) -> None:
         )
 
 
+def _deep_merge(
+    base: Mapping[str, Any],
+    override: Mapping[str, Any],
+) -> dict[str, Any]:
+    merged = copy.deepcopy(dict(base))
+    for key, value in override.items():
+        if isinstance(value, Mapping) and isinstance(merged.get(key), Mapping):
+            merged[key] = _deep_merge(dict(merged[key]), value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
 def _reject_unknown_keys(
-    value: Mapping[str, Any], allowed: set[str], context: str
+    value: Mapping[str, Any],
+    allowed: set[str],
+    context: str,
 ) -> None:
     unknown = sorted(repr(key) for key in value if key not in allowed)
     if unknown:
@@ -633,7 +478,9 @@ def _reject_unknown_keys(
 
 
 def _require_mapping(
-    value: Mapping[str, Any], key: str, context: str
+    value: Mapping[str, Any],
+    key: str,
+    context: str,
 ) -> dict[str, Any]:
     nested = value.get(key)
     if not isinstance(nested, Mapping):
@@ -715,3 +562,12 @@ def _require_optional_positive_number(raw: Any, name: str) -> None:
         minimum=0.0,
         minimum_inclusive=False,
     )
+
+
+__all__ = [
+    "DEFAULT_HISTORY_POLICY",
+    "DEFAULT_METRIC_POLICY",
+    "resolve_history_policy",
+    "resolve_metric_policy",
+    "validate_metric_policy",
+]

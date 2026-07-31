@@ -10,7 +10,7 @@ or the existing `states`, `results`, and `abnormalTimeRange` fields.
 
 ```text
 strict standard/inference input
--> existing preprocessing and per-metric KDE detection
+-> TimeSeries normalization and per-metric KDE detection
 -> confirmed target anomaly events
 -> anomalous lower-metric filtering
 -> bounded time alignment
@@ -139,40 +139,44 @@ name. `allAssociations` contains the complete ranking; `topAssociations`
 contains at most `top_k` entries. Contributions across `allAssociations` sum
 to approximately 100%, but the truncated Top K need not.
 
-## Configuration
+## Injected Policy
 
-Association settings live in the existing per-metric YAML. Old metric files
-without this section are deep-merged with the disabled defaults.
+Association settings are supplied as an in-memory policy. A representative
+policy is:
 
-```yaml
-association:
-  enabled: false
-  target_metrics:
-    - timing_s/step
-  candidate_mode: abnormal_lower_metrics
-  weights:
-    correlation: 0.5
-    random_forest: 0.5
-  top_k: 5
-  context_ratio: 1.0
-  min_aligned_points: 10
-  min_rf_samples: 30
-  min_coverage_ratio: 0.6
-  alignment_tolerance: null
-  random_forest:
-    n_estimators: 200
-    class_weight: balanced
-    random_state: 42
-    importance_method: permutation
+```python
+association_policy = {
+    'enabled': True,
+    'target_metrics': ['timing_s/step'],
+    'candidate_mode': 'abnormal_lower_metrics',
+    'weights': {
+        'correlation': 0.5,
+        'random_forest': 0.5,
+    },
+    'top_k': 5,
+    'context_ratio': 1.0,
+    'min_aligned_points': 10,
+    'min_rf_samples': 30,
+    'min_coverage_ratio': 0.6,
+    'alignment_tolerance': None,
+    'random_forest': {
+        'n_estimators': 200,
+        'class_weight': 'balanced',
+        'random_state': 42,
+        'importance_method': 'permutation',
+    },
+}
 ```
 
 `alignment_tolerance` is an optional advanced override for non-step alignment;
 it must be positive when set. The only current `candidate_mode` is
 `abnormal_lower_metrics`. Weights must be non-negative and sum to `1`.
 
-`--association-target` overrides the YAML target list and enables analysis for
-that invocation. Without a CLI target or an enabled YAML section, the detector
-does not add `associationAnalysis`, preserving the original response shape.
+`association_targets` is an explicit per-call target override. When supplied,
+it enables analysis for those targets instead of the policy's target list. If
+neither an override nor an enabled policy supplies targets, the detector omits
+`associationAnalysis` and preserves the core detection result shape. Policy
+storage and business defaults belong to the caller.
 
 ## Input and Output
 

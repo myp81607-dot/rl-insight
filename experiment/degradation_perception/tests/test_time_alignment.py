@@ -19,7 +19,7 @@ import math
 import pytest
 
 from experiment.degradation_perception.perception_config import TimeSeries
-from experiment.degradation_perception.preprocessing import preprocess_time_series
+from experiment.degradation_perception.timeseries import preprocess_time_series
 from experiment.degradation_perception.time_alignment import (
     AlignmentResult,
     align_candidate_series,

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Any
+from typing import Any, Mapping, TypedDict
 
 
 class MetricState(IntEnum):
@@ -54,6 +54,29 @@ class ThresholdModel:
     upper_threshold: float
     bandwidth: float
     diagnostics: dict[str, Any] = field(default_factory=dict)
+
+
+class DetectionInput(TypedDict):
+    """Two explicit phases of metric-keyed standardized time series."""
+
+    standard: Mapping[str, TimeSeries]
+    inference: Mapping[str, TimeSeries]
+
+
+class _DetectionResultRequired(TypedDict):
+    '''Fields always returned after an algorithm invocation.'''
+
+    taskId: str
+    states: dict[str, int]
+    results: dict[str, dict[str, Any]]
+    abnormalTimeRange: dict[str, list[dict[str, Any]]]
+
+
+class DetectionResult(_DetectionResultRequired, total=False):
+    '''Structured, JSON-native degradation-perception result.'''
+
+    metricErrors: dict[str, dict[str, str]]
+    associationAnalysis: dict[str, Any]
 
 
 DEFAULT_METRIC = "timing_s/step"

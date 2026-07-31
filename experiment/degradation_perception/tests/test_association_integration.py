@@ -15,13 +15,13 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 
 import pytest
-import yaml
 
 from experiment.degradation_perception.algorithm import DegradationPerception
-from experiment.degradation_perception.config_loader import ensure_metric_config
-from experiment.degradation_perception.main import main
+from experiment.degradation_perception.perception_config import TimeSeries
+from experiment.degradation_perception.policy import resolve_metric_policy
 
 
 TARGET = "timing_s/step"
@@ -67,34 +67,32 @@ def _dataset(
 ) -> dict:
     return {
         "standard": {
-            metric: {
-                "timestamps": list(range(1, len(STANDARD_PATTERN) + 1)),
-                "values": _standard(level),
-            }
+            metric: TimeSeries(
+                timestamps=list(range(1, len(STANDARD_PATTERN) + 1)),
+                values=_standard(level),
+            )
             for metric, (level, _) in specifications.items()
         },
         "inference": {
-            metric: {
-                "timestamps": list(range(100, 160)),
-                "values": _inference(level, events),
-            }
+            metric: TimeSeries(
+                timestamps=list(range(100, 160)),
+                values=_inference(level, events),
+            )
             for metric, (level, events) in specifications.items()
         },
     }
 
 
 def _enable_association(
-    config_dir,
     *,
     target_metrics=None,
     context_ratio=0.5,
     min_aligned_points=10,
     min_rf_samples=20,
     top_k=5,
-) -> None:
+) -> dict:
     targets = list(target_metrics or [TARGET])
-    path = ensure_metric_config(targets[0], config_dir=config_dir)
-    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    data = resolve_metric_policy(targets[0])
     data["association"].update(
         {
             "enabled": True,
@@ -107,7 +105,7 @@ def _enable_association(
         }
     )
     data["association"]["random_forest"]["n_estimators"] = 64
-    path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    return {targets[0]: data}
 
 
 def _primary_dataset() -> dict:
@@ -121,11 +119,10 @@ def _primary_dataset() -> dict:
     )
 
 
-def test_disabled_association_preserves_original_top_level_shape(tmp_path):
+def test_disabled_association_preserves_original_top_level_shape():
     response = DegradationPerception(
         dataset=_primary_dataset(),
         metrics=[TARGET, STRONG, WEAKER, NORMAL],
-        config_dir=tmp_path / "config",
     ).detect()
     assert set(response) == {
         "taskId",
@@ -136,13 +133,12 @@ def test_disabled_association_preserves_original_top_level_shape(tmp_path):
     assert "associationAnalysis" not in response
 
 
-def test_real_kde_then_association_produces_ranked_event_and_rf_evidence(tmp_path):
-    config_dir = tmp_path / "config"
-    _enable_association(config_dir)
+def test_real_kde_then_association_produces_ranked_event_and_rf_evidence():
+    metric_policies = _enable_association()
     response = DegradationPerception(
         dataset=_primary_dataset(),
         metrics=[TARGET, STRONG, WEAKER, NORMAL],
-        config_dir=config_dir,
+        metric_policies=metric_policies,
     ).detect()
     assert response["states"] == {
         TARGET: 0,
@@ -168,11 +164,15 @@ def test_real_kde_then_association_produces_ranked_event_and_rf_evidence(tmp_pat
     }
     assert event["topAssociations"][0]["metric"] == STRONG
     assert event["topAssociations"][0]["rank"] == 1
-    assert event["randomForestStatus"] in {"success", "partial_success"}
-    assert event["randomForestDiagnostics"]["importanceMethod"] in {
-        "permutation",
-        "impurity_fallback",
-    }
+    if importlib.util.find_spec("sklearn") is None:
+        assert event["randomForestStatus"] == "dependency_unavailable"
+        assert event["randomForestDiagnostics"]["importanceMethod"] is None
+    else:
+        assert event["randomForestStatus"] in {"success", "partial_success"}
+        assert event["randomForestDiagnostics"]["importanceMethod"] in {
+            "permutation",
+            "impurity_fallback",
+        }
     assert any(
         item
         == {
@@ -184,39 +184,11 @@ def test_real_kde_then_association_produces_ranked_event_and_rf_evidence(tmp_pat
     json.dumps(response, allow_nan=False)
 
 
-def test_cli_target_override_enables_analysis_without_yaml_flag(
-    tmp_path,
-    capsys,
-):
-    data_path = tmp_path / "data.json"
-    data_path.write_text(json.dumps(_primary_dataset()), encoding="utf-8")
-    code = main(
-        [
-            "--path",
-            str(data_path),
-            "--metrics",
-            TARGET,
-            STRONG,
-            WEAKER,
-            NORMAL,
-            "--association-target",
-            TARGET,
-            "--config-dir",
-            str(tmp_path / "config"),
-        ]
-    )
-    output = json.loads(capsys.readouterr().out)
-    assert code == 0
-    assert output["associationAnalysis"]["enabled"] is True
-    assert output["associationAnalysis"]["targets"][TARGET]["events"]
-
-
 def test_missing_or_normal_target_returns_business_status_not_exception(tmp_path):
     missing = DegradationPerception(
         dataset=_primary_dataset(),
         metrics=[STRONG],
         association_targets=[TARGET],
-        config_dir=tmp_path / "missing-config",
     ).detect()
     assert missing["associationAnalysis"]["targets"][TARGET]["status"] == (
         "target_metric_missing"
@@ -228,7 +200,6 @@ def test_missing_or_normal_target_returns_business_status_not_exception(tmp_path
         dataset=selected_but_missing_data,
         metrics=[TARGET, STRONG],
         association_targets=[TARGET],
-        config_dir=tmp_path / "selected-missing-config",
     ).detect()
     assert (
         selected_but_missing["associationAnalysis"]["targets"][TARGET]["status"]
@@ -236,12 +207,15 @@ def test_missing_or_normal_target_returns_business_status_not_exception(tmp_path
     )
 
     normal_data = _primary_dataset()
-    normal_data["inference"][TARGET]["values"] = _inference(1.0, [])
+    target_series = normal_data["inference"][TARGET]
+    normal_data["inference"][TARGET] = TimeSeries(
+        timestamps=list(target_series.timestamps),
+        values=_inference(1.0, []),
+    )
     normal = DegradationPerception(
         dataset=normal_data,
         metrics=[TARGET, STRONG],
         association_targets=[TARGET],
-        config_dir=tmp_path / "normal-config",
     ).detect()
     assert normal["associationAnalysis"]["targets"][TARGET]["status"] == (
         "target_not_abnormal"
@@ -250,19 +224,18 @@ def test_missing_or_normal_target_returns_business_status_not_exception(tmp_path
 
 def test_failed_lower_metric_is_excluded_without_changing_target_kde(tmp_path):
     data = _primary_dataset()
-    data["standard"]["broken_metric"] = {
-        "timestamps": [1, 2, 3],
-        "values": [1.0],
-    }
-    data["inference"]["broken_metric"] = {
-        "timestamps": list(range(100, 160)),
-        "values": [1.0] * 60,
-    }
+    data["standard"]["broken_metric"] = TimeSeries(
+        timestamps=[1, 2, 3],
+        values=[1.0],
+    )
+    data["inference"]["broken_metric"] = TimeSeries(
+        timestamps=list(range(100, 160)),
+        values=[1.0] * 60,
+    )
     response = DegradationPerception(
         dataset=data,
         metrics=[TARGET, STRONG, "broken_metric"],
         association_targets=[TARGET],
-        config_dir=tmp_path / "config",
     ).detect()
     assert response["states"][TARGET] == 0
     assert response["abnormalTimeRange"][TARGET]
@@ -275,19 +248,18 @@ def test_failed_lower_metric_is_excluded_without_changing_target_kde(tmp_path):
 
 def test_constant_candidate_is_identified_before_abnormal_window_filter(tmp_path):
     data = _primary_dataset()
-    data["standard"]["constant_metric"] = {
-        "timestamps": list(range(1, len(STANDARD_PATTERN) + 1)),
-        "values": [5.0] * len(STANDARD_PATTERN),
-    }
-    data["inference"]["constant_metric"] = {
-        "timestamps": list(range(100, 160)),
-        "values": [5.0] * 60,
-    }
+    data["standard"]["constant_metric"] = TimeSeries(
+        timestamps=list(range(1, len(STANDARD_PATTERN) + 1)),
+        values=[5.0] * len(STANDARD_PATTERN),
+    )
+    data["inference"]["constant_metric"] = TimeSeries(
+        timestamps=list(range(100, 160)),
+        values=[5.0] * 60,
+    )
     response = DegradationPerception(
         dataset=data,
         metrics=[TARGET, STRONG, "constant_metric"],
         association_targets=[TARGET],
-        config_dir=tmp_path / "config",
     ).detect()
 
     event = response["associationAnalysis"]["targets"][TARGET]["events"][0]
@@ -307,9 +279,7 @@ def test_multiple_target_events_are_analyzed_independently(tmp_path):
             second: (8.0, [(40, 47, 14.0)]),
         }
     )
-    config_dir = tmp_path / "config"
-    _enable_association(
-        config_dir,
+    metric_policies = _enable_association(
         context_ratio=0.5,
         min_aligned_points=5,
         min_rf_samples=100,
@@ -317,7 +287,7 @@ def test_multiple_target_events_are_analyzed_independently(tmp_path):
     response = DegradationPerception(
         dataset=data,
         metrics=[TARGET, first, second],
-        config_dir=config_dir,
+        metric_policies=metric_policies,
     ).detect()
     events = response["associationAnalysis"]["targets"][TARGET]["events"]
     assert len(events) == 2
@@ -344,12 +314,11 @@ def test_top_five_truncation_keeps_full_contribution_and_stable_ties(tmp_path):
             for index, metric in enumerate(candidates)
         }
     )
-    config_dir = tmp_path / "config"
-    _enable_association(config_dir, min_rf_samples=100)
+    metric_policies = _enable_association(min_rf_samples=100)
     response = DegradationPerception(
         dataset=_dataset(specifications),
         metrics=[TARGET, *candidates],
-        config_dir=config_dir,
+        metric_policies=metric_policies,
     ).detect()
     event = response["associationAnalysis"]["targets"][TARGET]["events"][0]
     assert len(event["topAssociations"]) == 5
@@ -379,9 +348,7 @@ def test_top_five_handles_candidate_counts_below_equal_and_above_limit(
             for index, metric in enumerate(candidates)
         }
     )
-    config_dir = tmp_path / "config"
-    _enable_association(
-        config_dir,
+    metric_policies = _enable_association(
         min_rf_samples=100,
         top_k=5,
     )
@@ -389,7 +356,7 @@ def test_top_five_handles_candidate_counts_below_equal_and_above_limit(
     response = DegradationPerception(
         dataset=_dataset(specifications),
         metrics=[TARGET, *candidates],
-        config_dir=config_dir,
+        metric_policies=metric_policies,
     ).detect()
     event = response["associationAnalysis"]["targets"][TARGET]["events"][0]
     all_associations = event["allAssociations"]
@@ -423,16 +390,14 @@ def test_top_k_changes_only_the_view_not_full_contributions(tmp_path):
     contributions_by_top_k = {}
 
     for top_k in (3, 5, 8):
-        config_dir = tmp_path / f"config-{top_k}"
-        _enable_association(
-            config_dir,
+        metric_policies = _enable_association(
             min_rf_samples=100,
             top_k=top_k,
         )
         response = DegradationPerception(
             dataset=dataset,
             metrics=[TARGET, *candidates],
-            config_dir=config_dir,
+            metric_policies=metric_policies,
         ).detect()
         event = response["associationAnalysis"]["targets"][TARGET]["events"][0]
         all_associations = event["allAssociations"]
@@ -475,7 +440,6 @@ def test_multiple_top_metrics_are_isolated_and_never_rank_each_other(tmp_path):
         dataset=data,
         metrics=[TARGET, second_target, candidate],
         association_targets=[TARGET, second_target],
-        config_dir=tmp_path / "config",
     ).detect()
     targets = response["associationAnalysis"]["targets"]
     assert set(targets) == {TARGET, second_target}
