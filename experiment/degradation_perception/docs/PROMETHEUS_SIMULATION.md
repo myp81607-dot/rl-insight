@@ -236,6 +236,6 @@ ranking score, not a causal probability.
   not evidence about production distributions.
 - Association contribution is not a root-cause or causal probability.
 
-For real HTTP acquisition, use
-[`prometheus_workflow.example.yaml`](../prometheus_workflow.example.yaml) and
-the tester workflow in the main [README](../README.md).
+For real HTTP acquisition, use the service-discovered `analyze` or `monitor`
+commands documented in the main [README](../README.md). The simulator does not
+exercise RL-Insight service discovery or scrape-target registration.

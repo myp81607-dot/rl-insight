@@ -16,12 +16,26 @@
 
 from .algorithm import DegradationPerception, build_standard_data, get_standard_data
 from .preprocessing import prometheus_query_range_to_series
+from .prometheus_query import PrometheusQueryClient
+from .rl_insight_integration import (
+    DerivedMetricPublisher,
+    MetricQuerySpec,
+    PrometheusDegradationRunner,
+    derive_detection_windows,
+    resolve_prometheus_endpoint,
+)
 from .stable_segment_detector import StableSegmentDetector
 
 __all__ = [
     "DegradationPerception",
+    "DerivedMetricPublisher",
+    "MetricQuerySpec",
+    "PrometheusDegradationRunner",
+    "PrometheusQueryClient",
     "StableSegmentDetector",
     "build_standard_data",
+    "derive_detection_windows",
     "get_standard_data",
     "prometheus_query_range_to_series",
+    "resolve_prometheus_endpoint",
 ]

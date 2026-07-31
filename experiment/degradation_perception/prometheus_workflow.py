@@ -22,9 +22,7 @@ import json
 import math
 import os
 import sys
-import urllib.error
 import urllib.parse
-import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
@@ -46,11 +44,14 @@ from .prometheus_matrix_adapter import (
     PrometheusMatrixError,
     convert_matrix_response,
 )
+from .prometheus_query import (
+    PrometheusQueryError,
+    fetch_query_range as _shared_fetch_query_range,
+)
 from .result_presentation import build_top5_result
 
 
 _MAX_CONFIG_BYTES = 1024 * 1024
-_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 _MAX_EXPECTED_POINTS_PER_SERIES = 1_000_000
 _CONFIG_KEYS = {
     "prometheus",
@@ -94,7 +95,7 @@ _RANDOM_FOREST_KEYS = {
 QueryFetcher = Callable[..., Mapping[str, Any]]
 
 
-class PrometheusWorkflowError(ValueError):
+class PrometheusWorkflowError(PrometheusQueryError):
     """Structured configuration, HTTP, or orchestration failure."""
 
     def __init__(
@@ -107,7 +108,7 @@ class PrometheusWorkflowError(ValueError):
         self.code = str(code)
         self.message = str(message)
         self.details = copy.deepcopy(dict(details or {}))
-        super().__init__(f"{self.code}: {self.message}")
+        super().__init__(code, message, details=details)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -576,10 +577,6 @@ def load_workflow_config(path: str | os.PathLike[str]) -> dict[str, Any]:
     return normalize_workflow_config(payload)
 
 
-def _reject_json_constant(value: str) -> None:
-    raise ValueError(f"non-standard JSON constant: {value}")
-
-
 def fetch_query_range(
     *,
     base_url: str,
@@ -591,66 +588,25 @@ def fetch_query_range(
     bearer_token: str | None = None,
     use_environment_proxy: bool = False,
 ) -> dict[str, Any]:
-    """Issue one real Prometheus HTTP GET and decode its full JSON response."""
+    """Call the shared Prometheus read client for legacy compatibility."""
 
-    parameters = urllib.parse.urlencode(
-        {
-            "query": query,
-            "start": start,
-            "end": end,
-            "step": f"{step:g}",
-        }
-    )
-    url = f"{base_url.rstrip('/')}/api/v1/query_range?{parameters}"
-    headers = {
-        "Accept": "application/json",
-        "User-Agent": "rl-insight-degradation-perception/1",
-    }
-    if bearer_token:
-        headers["Authorization"] = f"Bearer {bearer_token}"
-    request = urllib.request.Request(url, headers=headers, method="GET")
     try:
-        if use_environment_proxy:
-            opened = urllib.request.urlopen(request, timeout=timeout_seconds)
-        else:
-            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-            opened = opener.open(request, timeout=timeout_seconds)
-        with opened as response:
-            body = response.read(_MAX_RESPONSE_BYTES + 1)
-    except urllib.error.HTTPError as exc:
-        try:
-            body_excerpt = exc.read(4096).decode("utf-8", errors="replace")
-        except OSError:
-            body_excerpt = ""
-        _fail(
-            "prometheus_http_error",
-            f"Prometheus returned HTTP {exc.code}",
-            details={"status": exc.code, "bodyExcerpt": body_excerpt},
+        return _shared_fetch_query_range(
+            base_url=base_url,
+            query=query,
+            start=start,
+            end=end,
+            step=step,
+            timeout_seconds=timeout_seconds,
+            bearer_token=bearer_token,
+            use_environment_proxy=use_environment_proxy,
         )
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        _fail(
-            "prometheus_connection_error",
-            f"failed to contact Prometheus: {exc}",
-        )
-    if len(body) > _MAX_RESPONSE_BYTES:
-        _fail(
-            "prometheus_response_too_large",
-            f"Prometheus response exceeds {_MAX_RESPONSE_BYTES} bytes",
-        )
-    try:
-        decoded = body.decode("utf-8")
-        payload = json.loads(decoded, parse_constant=_reject_json_constant)
-    except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
-        _fail(
-            "invalid_prometheus_json",
-            f"Prometheus response is not strict UTF-8 JSON: {exc}",
-        )
-    if not isinstance(payload, Mapping):
-        _fail(
-            "invalid_prometheus_json",
-            "Prometheus response root must be an object",
-        )
-    return dict(payload)
+    except PrometheusQueryError as exc:
+        raise PrometheusWorkflowError(
+            exc.code,
+            exc.message,
+            details=exc.details,
+        ) from exc
 
 
 def _write_strict_json(path: Path, value: Any) -> Path:
