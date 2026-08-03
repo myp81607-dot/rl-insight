@@ -1,0 +1,21 @@
+# Copy this file outside the repository and replace only the placeholders.
+standard_log: /path/to/confirmed-healthy.log
+
+remote:
+  host: "<remote-host>"
+  port: 22
+  username: "<username>"
+  log_path: /path/to/verl-step-metrics.log
+  # key_filename: /path/to/read-only-private-key
+  # known_hosts: /path/to/known_hosts
+  # password_env: RL_INSIGHT_MONITOR_SSH_PASSWORD
+  connect_timeout_seconds: 10
+  read_timeout_seconds: 30
+
+metrics:
+  - timing_s/step
+  - actor/entropy
+
+poll_interval_seconds: 300
+output_dir: ./monitor_output
+task_id: degradation-demo
