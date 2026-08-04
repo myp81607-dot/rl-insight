@@ -34,6 +34,11 @@ recipe = [
   "torch",
   "ijson",
 ]
+degradation = [
+  "numpy",
+  "scipy",
+  "scikit-learn>=1.5,<2",
+]
 test = [
   "pytest",
 ]
@@ -46,9 +51,23 @@ rl-insight-recipe = "recipe:main"
 Homepage = "https://github.com/verl-project/rl-insight"
 Source = "https://github.com/verl-project/rl-insight"
 
+[tool.setuptools]
+include-package-data = false
+
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["rl_insight", "rl_insight.*", "recipe", "recipe.*"]
+include = [
+  "rl_insight",
+  "rl_insight.*",
+  "recipe",
+  "recipe.*",
+  "experiment",
+  "experiment.*",
+]
+exclude = [
+  "experiment.degradation_perception.tests",
+  "experiment.degradation_perception.tests.*",
+]
 
 [tool.setuptools.package-data]
 rl_insight = [
