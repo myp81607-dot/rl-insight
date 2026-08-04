@@ -1,10 +1,11 @@
 # RL-Insight 劣化感知：VeRL 日志运行指南
 
-本目录保留现有 KDE、平稳段、多模态、异常点和异常区间算法，并增加两种真实
-VeRL step-metrics 日志入口：
+本目录保留现有 KDE、平稳段、多模态、异常点、异常区间和关联分析算法，并将
+真实 VeRL step-metrics 日志运行明确拆成三步：
 
-- 离线检测：本地 `healthy.log` + 本地 inference 日志，执行一次后保存 JSON；
-- 持续检测：本地固定 `healthy.log` + SSH 远程运行日志，按间隔轮询新增 step。
+- `fit`：读取正常 `healthy.log`，生成可复用的 `baseline_model.json`；
+- `detect`：加载基线和本地 inference 日志，生成一次性的 `result.json`；
+- `monitor`：启动时加载同一基线，通过 SSH 定时轮询远程 inference 日志。
 
 持续检测是 SSH 轮询，实际延迟取决于配置的轮询间隔，不是真正的流式推送。
 
@@ -42,7 +43,7 @@ NaN 和 Inf 会被跳过；一个指标缺点不会给它补零，也不会影�
 - `parse_verl_training_log`：返回 `dict[str, TimeSeries]`；
 - `load_verl_training_log`：读取本地 UTF-8 日志。
 
-## 离线检测
+## 1. fit：学习并保存正常基线
 
 先查看健康日志中成功解析到的原始指标名：
 
@@ -60,30 +61,55 @@ actor/entropy
 timing_s/step
 ```
 
-执行检测：
+执行拟合：
 
 ```bash
-python -m experiment.degradation_perception.main \
+python -m experiment.degradation_perception.main fit \
   --standard-log healthy.log \
-  --inference-log inference.log \
   --metrics timing_s/step actor/entropy \
-  --source-type training_log \
-  --task-id degradation-demo \
-  --debug-kde \
-  --output result.json
+  --policy-config algorithm_config.yaml \
+  --output-model models/baseline_model.json
 ```
 
-`healthy.log` 只构造 `standard`，`inference.log` 只构造 `inference`；两份日志的
-step 可以分别从 0 开始。`--debug-kde` 只控制终端详细展示，不改变算法计算。
-终端阈值显示两位小数，JSON 保存完整浮点精度。
+`baseline_model.json` 保存每个指标的完整策略和所有独立正常模式。多模式不会被
+平均或合并。写入使用同目录临时文件和原子替换；已有模型会先备份到同级
+`history/`。新模型生成或校验失败时，不会损坏当前模型。
 
-## SSH 轮询检测
+## 2. detect：加载基线进行离线检测
+
+复制并修改 [real_test.example.json](./real_test.example.json)。其中所有相对路径均
+相对于配置文件所在目录解析；`output` 的父目录不存在时会自动创建。
+
+```json
+{
+  "baseline_model": "./models/baseline_model.json",
+  "policy_config": "./algorithm_config.yaml",
+  "inference_log": "./data/inference.log",
+  "metrics": ["timing_s/step", "actor/entropy"],
+  "task_id": "real-test-001",
+  "debug_kde": true,
+  "output": "./results/result.json"
+}
+```
+
+```bash
+python -m experiment.degradation_perception.main detect \
+  --config real_test.json
+```
+
+此阶段只读取 `baseline_model.json` 和 `inference_log`，不读取 `healthy.log`，也不
+重新拟合 KDE。inference 只用于本次检测，不能更新基线。配置中的 `output` 会保存
+标准 JSON `result.json`；终端阈值可以按 `debug_kde` 展示两位小数，文件保留完整
+浮点精度。
+
+## 3. monitor：SSH 轮询检测
 
 复制脱敏配置并填写测试环境信息，不要提交真实地址、用户名、密码、私钥内容或
 内部日志路径：
 
 ```bash
 cp experiment/degradation_perception/monitor_config.example.yaml monitor_config.yaml
+cp experiment/degradation_perception/algorithm_config.yaml algorithm_config.yaml
 ```
 
 持续运行：
@@ -104,28 +130,32 @@ python -m experiment.degradation_perception.remote_monitor \
 轮询过程如下：
 
 ```text
-启动时读取一次本地 healthy.log，固定为 standard
+启动时读取一次本地 baseline_model.json
 → 通过 Paramiko SFTP 只读获取远程 .log 快照
 → 丢弃尚未换行的活动日志尾行
 → 只接受 step > last_step 的选中指标
-→ 累积到 inference 缓冲区
+→ 累积到固定长度的 inference 滚动窗口
 → 每个指标都达到算法最小点数后执行检测
-→ 原子保存本轮 JSON
-→ 更新 last_step，并清空本轮已消费缓冲区
+→ 原子保存本轮结果 JSON
+→ 将 lastStep 和当前缓冲区一起原子保存到 state_file
 → 等待下一轮
 ```
 
 数据不足时会保留在缓冲区，且不会生成伪异常结果。无新增 step 时不会重复检测。
-SSH、检测或写盘失败会记录错误并等待下一轮；失败轮次不会提交候选数据。
+滚动窗口由 `inference_window_steps` 限制，不会无限增长；重启后从 `state_file`
+恢复 `lastStep` 和未完成缓冲。SSH、检测或写盘失败会记录错误并等待下一轮；失败
+轮次不会提交候选状态。在线模式不需要也不会读取 `healthy.log`，远端文件只读。
 
 ## 算法与输出
 
 ```text
-读取正常日志
+fit：读取正常日志
 → 解析 step metrics
 → 找到平稳片段
 → KDE 学习正常分布
 → 计算每个指标的标准区间
+→ 保存 baseline_model.json
+detect / monitor：加载 baseline_model.json
 → 读取待检测日志
 → 标记异常点
 → 合并异常区间
@@ -154,14 +184,16 @@ SSH、检测或写盘失败会记录错误并等待下一轮；失败轮次不�
 
 ## 注意事项
 
-- `healthy.log` 必须是已确认正常的数据，运行期间不会自动更新；
+- `healthy.log` 必须是已确认正常的数据，只在 `fit` 阶段读取；
 - inference 数据不会进入正常基线，且不保证一定出现异常；
-- 两类日志应尽量来自相同模型、代码版本和训练配置；
+- 在线和离线检测使用同一个 `baseline_model.json`；
+- 更换设备、模型、卡数、代码版本或训练配置后，通常需要重新 `fit`；
 - 日志中的时间表示 step，SSH 数据仍以 `source_type=training_log` 调用算法；
 - 指标名始终保留原始形式；
 - 内部 KDE、分位数和阈值判断不做提前四舍五入；
 - SSH 默认拒绝未知 host key，可使用系统 known_hosts 或配置 `known_hosts`；
 - 密码应通过 `password_env` 指定的环境变量提供，不写进配置文件。
+- 在线监控是按 `poll_interval_seconds` 轮询，不是流式推送。
 
 ## 测试
 

@@ -1,5 +1,7 @@
 # Copy this file outside the repository and replace only the placeholders.
-standard_log: /path/to/confirmed-healthy.log
+# The same fitted baseline_model.json can be shared by detect and monitor.
+baseline_model: ./models/baseline_model.json
+policy_config: ./algorithm_config.yaml
 
 remote:
   host: "<remote-host>"
@@ -17,5 +19,7 @@ metrics:
   - actor/entropy
 
 poll_interval_seconds: 300
+inference_window_steps: 100
+state_file: ./monitor_output/monitor_state.json
 output_dir: ./monitor_output
 task_id: degradation-demo

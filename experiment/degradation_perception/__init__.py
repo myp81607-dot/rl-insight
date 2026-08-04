@@ -16,6 +16,13 @@
 
 from .algorithm import DegradationPerception, build_standard_data, get_standard_data
 from .association_analysis import AssociationAnalyzer
+from .baseline_model import (
+    BaselineDetectionRunner,
+    BaselineModelFile,
+    fit_baseline_model,
+    load_baseline_model,
+    save_baseline_model,
+)
 from .perception_config import (
     DetectionInput,
     DetectionResult,
@@ -40,6 +47,8 @@ from .training_log import (
 )
 
 __all__ = [
+    "BaselineDetectionRunner",
+    "BaselineModelFile",
     'TrainingLogParseResult',
     'load_verl_training_log',
     'parse_verl_training_log',
@@ -56,9 +65,12 @@ __all__ = [
     "ThresholdModel",
     "TimeSeries",
     "build_standard_data",
+    "fit_baseline_model",
     "get_standard_data",
+    "load_baseline_model",
     "preprocess_time_series",
     "resolve_history_policy",
     "resolve_metric_policy",
+    "save_baseline_model",
     "validate_detection_input",
 ]

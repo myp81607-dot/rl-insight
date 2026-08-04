@@ -153,6 +153,20 @@ def resolve_metric_policy(
     return resolved
 
 
+def overlay_metric_policy(
+    metric: str,
+    base: Mapping[str, Any],
+    override: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Deeply overlay a validated policy, preserving nested base settings."""
+
+    resolved_base = resolve_metric_policy(metric, base)
+    supplied = {} if override is None else dict(override)
+    resolved = _deep_merge(resolved_base, supplied)
+    validate_metric_policy(resolved, metric)
+    return resolved
+
+
 def resolve_history_policy(
     override: Mapping[str, Any] | None = None,
 ) -> dict[str, int]:
@@ -569,5 +583,6 @@ __all__ = [
     "DEFAULT_METRIC_POLICY",
     "resolve_history_policy",
     "resolve_metric_policy",
+    "overlay_metric_policy",
     "validate_metric_policy",
 ]
