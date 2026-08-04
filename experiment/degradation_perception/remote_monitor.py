@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Poll a remote VeRL log over SSH and run the shared degradation detector."""
+"""Poll a remote VeRL log and detect with one persisted KDE baseline."""
 
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import re
@@ -30,14 +31,18 @@ from typing import Any, Protocol
 
 import yaml
 
-from .detection_runtime import DetectionRunner, serialize_result
-from .perception_config import TimeSeries
-from .policy import resolve_metric_policy
-from .timeseries import preprocess_time_series
-from .training_log import (
-    load_verl_training_log,
-    parse_verl_training_log_with_metadata,
+from .algorithm_policy import load_algorithm_policy_config
+from .baseline_model import (
+    BaselineDetectionRunner,
+    load_baseline_model,
 )
+from .detection_runtime import serialize_result
+from .perception_config import TimeSeries
+from .timeseries import preprocess_time_series
+from .training_log import parse_verl_training_log_with_metadata
+
+
+STATE_SCHEMA_VERSION = 1
 
 
 class RemoteMonitorError(RuntimeError):
@@ -67,17 +72,20 @@ class RemoteConnectionConfig:
 
 @dataclass(frozen=True)
 class RemoteMonitorConfig:
-    standard_log: Path
+    baseline_model: Path
     remote: RemoteConnectionConfig
     metrics: tuple[str, ...]
     poll_interval_seconds: float
+    inference_window_steps: int
+    state_file: Path
     output_dir: Path
     task_id: str = "degradation-remote-monitor"
+    policy_config: Path | None = None
 
 
 @dataclass
 class MonitorState:
-    """Process-local state committed only at safe poll boundaries."""
+    """Durable state committed only after all work in a poll succeeds."""
 
     last_step: int | None = None
     inference_buffer: dict[str, TimeSeries] = field(default_factory=dict)
@@ -96,6 +104,18 @@ class PollOutcome:
 class RemoteLogReader(Protocol):
     def read_snapshot(self) -> str:
         """Return a read-only UTF-8 snapshot of the remote log."""
+
+
+class ModelDetectionRunner(Protocol):
+    def minimum_inference_samples(self) -> dict[str, int]:
+        """Return the loaded model's per-metric inference minimum."""
+
+    def snapshot_runtime_state(self) -> Any: ...
+
+    def restore_runtime_state(self, snapshot: Any) -> None: ...
+
+    def run(self, inference: Mapping[str, TimeSeries]) -> dict[str, Any]:
+        """Detect one rolling inference window without fitting KDE."""
 
 
 class ParamikoRemoteLogReader:
@@ -181,8 +201,21 @@ def _positive_float(value: Any, name: str) -> float:
         number = float(value)
     except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(f"{name} must be a positive number") from exc
-    if not math.isfinite(number) or number <= 0:
+    if isinstance(value, bool) or not math.isfinite(number) or number <= 0:
         raise ValueError(f"{name} must be a positive number")
+    return number
+
+
+def _positive_int(value: Any, name: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a positive integer")
+    try:
+        number = int(value)
+        original = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must be a positive integer") from exc
+    if not math.isfinite(original) or original != number or number <= 0:
+        raise ValueError(f"{name} must be a positive integer")
     return number
 
 
@@ -193,7 +226,7 @@ def _local_path(base: Path, value: Any, name: str) -> Path:
 
 
 def load_remote_monitor_config(path: str | Path) -> RemoteMonitorConfig:
-    """Load the documented credential-free YAML shape."""
+    """Load the credential-free model-backed monitor YAML."""
 
     config_path = Path(path)
     try:
@@ -210,7 +243,10 @@ def load_remote_monitor_config(path: str | Path) -> RemoteMonitorConfig:
     if (
         not isinstance(raw_metrics, list)
         or not raw_metrics
-        or any(not isinstance(metric, str) or not metric.strip() for metric in raw_metrics)
+        or any(
+            not isinstance(metric, str) or not metric.strip()
+            for metric in raw_metrics
+        )
     ):
         raise ValueError("metrics must be a non-empty list of metric names")
     metrics = tuple(dict.fromkeys(metric.strip() for metric in raw_metrics))
@@ -219,12 +255,16 @@ def load_remote_monitor_config(path: str | Path) -> RemoteMonitorConfig:
         port = int(remote_raw.get("port", 22))
     except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError("remote.port must be an integer") from exc
-    if not 1 <= port <= 65535:
+    if isinstance(remote_raw.get("port", 22), bool) or not 1 <= port <= 65535:
         raise ValueError("remote.port must be between 1 and 65535")
 
     def optional_path(name: str) -> Path | None:
         value = remote_raw.get(name)
-        return None if value in (None, "") else _local_path(base, value, f"remote.{name}")
+        return None if value in (None, "") else _local_path(
+            base,
+            value,
+            f"remote.{name}",
+        )
 
     remote = RemoteConnectionConfig(
         host=_required_text(remote_raw.get("host"), "remote.host"),
@@ -236,7 +276,10 @@ def load_remote_monitor_config(path: str | Path) -> RemoteMonitorConfig:
         password_env=(
             None
             if remote_raw.get("password_env") in (None, "")
-            else _required_text(remote_raw.get("password_env"), "remote.password_env")
+            else _required_text(
+                remote_raw.get("password_env"),
+                "remote.password_env",
+            )
         ),
         connect_timeout_seconds=_positive_float(
             remote_raw.get("connect_timeout_seconds", 10),
@@ -247,23 +290,43 @@ def load_remote_monitor_config(path: str | Path) -> RemoteMonitorConfig:
             "remote.read_timeout_seconds",
         ),
     )
+    output_dir = _local_path(
+        base,
+        raw.get("output_dir", "./monitor_output"),
+        "output_dir",
+    )
+    policy_config = (
+        None
+        if raw.get("policy_config") in (None, "")
+        else _local_path(base, raw.get("policy_config"), "policy_config")
+    )
+    if policy_config is not None and not policy_config.is_file():
+        raise ValueError(
+            f"policy_config is not an existing file: {policy_config}"
+        )
     return RemoteMonitorConfig(
-        standard_log=_local_path(base, raw.get("standard_log"), "standard_log"),
+        baseline_model=_local_path(
+            base,
+            raw.get("baseline_model"),
+            "baseline_model",
+        ),
         remote=remote,
         metrics=metrics,
         poll_interval_seconds=_positive_float(
             raw.get("poll_interval_seconds", 300),
             "poll_interval_seconds",
         ),
-        output_dir=_local_path(
-            base,
-            raw.get("output_dir", "./monitor_output"),
-            "output_dir",
+        inference_window_steps=_positive_int(
+            raw.get("inference_window_steps"),
+            "inference_window_steps",
         ),
+        state_file=_local_path(base, raw.get("state_file"), "state_file"),
+        output_dir=output_dir,
         task_id=_required_text(
             raw.get("task_id", "degradation-remote-monitor"),
             "task_id",
         ),
+        policy_config=policy_config,
     )
 
 
@@ -272,6 +335,14 @@ def _merge_series(left: TimeSeries, right: TimeSeries) -> TimeSeries:
         [*left.timestamps, *right.timestamps],
         [*left.values, *right.values],
     )
+
+
+def _copy_series(series: TimeSeries) -> TimeSeries:
+    return TimeSeries(list(series.timestamps), list(series.values))
+
+
+def _copy_buffer(buffer: Mapping[str, TimeSeries]) -> dict[str, TimeSeries]:
+    return {metric: _copy_series(series) for metric, series in buffer.items()}
 
 
 def _complete_lines(snapshot: str) -> str:
@@ -299,57 +370,324 @@ def _safe_task_name(task_id: str) -> str:
     return value or "degradation"
 
 
+def _write_text_atomically(destination: Path, text: str) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(destination.name + ".tmp")
+    try:
+        temporary.write_text(text, encoding="utf-8")
+        os.replace(temporary, destination)
+    except BaseException:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
 def _save_result_atomically(
     result: Mapping[str, Any],
     output_dir: Path,
     task_id: str,
     step_range: Mapping[str, int],
 ) -> Path:
-    output_dir.mkdir(parents=True, exist_ok=True)
     filename = (
         f"{_safe_task_name(task_id)}_steps_"
         f"{step_range['startStep']}_{step_range['endStep']}.json"
     )
     destination = output_dir / filename
-    temporary = output_dir / (filename + ".tmp")
-    temporary.write_text(serialize_result(result) + "\n", encoding="utf-8")
-    os.replace(temporary, destination)
+    _write_text_atomically(destination, serialize_result(result) + "\n")
     return destination
 
 
+def _state_payload(
+    state: MonitorState,
+    *,
+    remote_log_path: str,
+    metrics: Sequence[str],
+) -> dict[str, Any]:
+    return {
+        "schemaVersion": STATE_SCHEMA_VERSION,
+        "lastStep": state.last_step,
+        "remoteLogPath": remote_log_path,
+        "roundId": state.round_id,
+        "metrics": list(metrics),
+        "bufferedSteps": list(state.buffered_steps),
+        "inferenceBuffer": {
+            metric: {
+                "timestamps": list(
+                    state.inference_buffer.get(metric, TimeSeries()).timestamps
+                ),
+                "values": list(
+                    state.inference_buffer.get(metric, TimeSeries()).values
+                ),
+            }
+            for metric in metrics
+        },
+    }
+
+
+def _save_monitor_state_atomically(
+    state: MonitorState,
+    path: Path,
+    *,
+    remote_log_path: str,
+    metrics: Sequence[str],
+) -> None:
+    encoded = json.dumps(
+        _state_payload(
+            state,
+            remote_log_path=remote_log_path,
+            metrics=metrics,
+        ),
+        ensure_ascii=False,
+        allow_nan=False,
+        indent=2,
+    )
+    _write_text_atomically(path, encoded + "\n")
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"state file contains non-finite JSON number: {value}")
+
+
+def _state_series(value: Any, *, metric: str) -> TimeSeries:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"state inferenceBuffer[{metric!r}] must be an object")
+    timestamps = value.get("timestamps")
+    values = value.get("values")
+    if not isinstance(timestamps, list) or not isinstance(values, list):
+        raise ValueError(
+            f"state inferenceBuffer[{metric!r}] must contain array fields"
+        )
+    if len(timestamps) != len(values):
+        raise ValueError(
+            f"state inferenceBuffer[{metric!r}] timestamps/values length mismatch"
+        )
+    for timestamp, item in zip(timestamps, values):
+        if isinstance(timestamp, bool) or isinstance(item, bool):
+            raise ValueError(
+                f"state inferenceBuffer[{metric!r}] contains boolean data"
+            )
+        try:
+            numeric_timestamp = float(timestamp)
+            numeric_value = float(item)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                f"state inferenceBuffer[{metric!r}] contains non-numeric data"
+            ) from exc
+        if (
+            not math.isfinite(numeric_timestamp)
+            or numeric_timestamp != int(numeric_timestamp)
+            or not math.isfinite(numeric_value)
+        ):
+            raise ValueError(
+                f"state inferenceBuffer[{metric!r}] contains invalid step data"
+            )
+    series = preprocess_time_series(timestamps, values)
+    if len(series) != len(timestamps):
+        raise ValueError(
+            f"state inferenceBuffer[{metric!r}] contains duplicate steps"
+        )
+    return series
+
+
+def _load_monitor_state(
+    path: Path,
+    *,
+    remote_log_path: str,
+    metrics: Sequence[str],
+    window_steps: int,
+) -> MonitorState:
+    empty = {metric: TimeSeries() for metric in metrics}
+    if not path.exists():
+        return MonitorState(inference_buffer=empty)
+    try:
+        raw = json.loads(
+            path.read_text(encoding="utf-8"),
+            parse_constant=_reject_json_constant,
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(f"could not load monitor state: {exc}") from exc
+    if not isinstance(raw, Mapping):
+        raise ValueError("monitor state root must be an object")
+    if raw.get("schemaVersion", STATE_SCHEMA_VERSION) != STATE_SCHEMA_VERSION:
+        raise ValueError("monitor state schemaVersion must be 1")
+    if raw.get("remoteLogPath") != remote_log_path:
+        raise ValueError(
+            "monitor state remoteLogPath does not match configured remote log"
+        )
+    state_metrics = raw.get("metrics")
+    if state_metrics is not None and state_metrics != list(metrics):
+        raise ValueError("monitor state metrics do not match configured metrics")
+
+    last_step = raw.get("lastStep")
+    if last_step is not None and (
+        isinstance(last_step, bool) or not isinstance(last_step, int)
+    ):
+        raise ValueError("monitor state lastStep must be an integer or null")
+    round_id = raw.get("roundId", 0)
+    if (
+        isinstance(round_id, bool)
+        or not isinstance(round_id, int)
+        or round_id < 0
+    ):
+        raise ValueError("monitor state roundId must be a non-negative integer")
+    raw_buffer = raw.get("inferenceBuffer", {})
+    if not isinstance(raw_buffer, Mapping):
+        raise ValueError("monitor state inferenceBuffer must be an object")
+    buffer = {
+        metric: _state_series(raw_buffer[metric], metric=metric)
+        if metric in raw_buffer
+        else TimeSeries()
+        for metric in metrics
+    }
+    buffer, buffered_steps = _trim_to_window(buffer, window_steps)
+    if last_step is not None and any(step > last_step for step in buffered_steps):
+        raise ValueError("monitor state buffer contains a step above lastStep")
+    return MonitorState(
+        last_step=last_step,
+        inference_buffer=buffer,
+        buffered_steps=buffered_steps,
+        round_id=round_id,
+    )
+
+
+def _trim_to_window(
+    buffer: Mapping[str, TimeSeries],
+    window_steps: int,
+) -> tuple[dict[str, TimeSeries], list[int]]:
+    all_steps = sorted(
+        {
+            int(timestamp)
+            for series in buffer.values()
+            for timestamp in series.timestamps
+        }
+    )
+    retained_steps = all_steps[-window_steps:]
+    retained = set(retained_steps)
+    trimmed: dict[str, TimeSeries] = {}
+    for metric, series in buffer.items():
+        pairs = [
+            (timestamp, value)
+            for timestamp, value in zip(series.timestamps, series.values)
+            if int(timestamp) in retained
+        ]
+        trimmed[metric] = TimeSeries(
+            timestamps=[timestamp for timestamp, _ in pairs],
+            values=[value for _, value in pairs],
+        )
+    return trimmed, retained_steps
+
+
+def _baseline_identity(baseline: Any, name: str, fallback: str) -> str:
+    value = getattr(baseline, name, None)
+    if value is None and isinstance(baseline, Mapping):
+        camel_name = {
+            "baseline_id": "baselineId",
+            "source_type": "sourceType",
+        }.get(name, name)
+        value = baseline.get(camel_name)
+    return value if isinstance(value, str) and value else fallback
+
+
+def _standard_sample_count(baseline: Any, metric: str) -> int | None:
+    metrics = getattr(baseline, "metrics", None)
+    if metrics is None and isinstance(baseline, Mapping):
+        metrics = baseline.get("metrics")
+    if not isinstance(metrics, Mapping) or metric not in metrics:
+        return None
+    entry = metrics[metric]
+    value = getattr(entry, "standard_samples", None)
+    if value is None and isinstance(entry, Mapping):
+        value = entry.get("standardSamples")
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return len(value)
+    return None
+
+
 class RemoteMonitor:
-    """Stateful poller with a fixed local standard and transactional batches."""
+    """Stateful poller backed by one immutable, pre-fitted KDE model."""
 
     def __init__(
         self,
         config: RemoteMonitorConfig,
         *,
         reader: RemoteLogReader | None = None,
-        runner: DetectionRunner | None = None,
+        baseline: Any | None = None,
+        runner: ModelDetectionRunner | None = None,
         now: Callable[[], datetime] | None = None,
     ) -> None:
         self.config = config
-        self.standard = load_verl_training_log(config.standard_log)
-        self.runner = runner or DetectionRunner(
-            standard=self.standard,
-            metrics=config.metrics,
-            task_id=config.task_id,
-            source_type="training_log",
+        self.baseline = (
+            load_baseline_model(
+                config.baseline_model,
+                expected_metrics=config.metrics,
+            )
+            if baseline is None
+            else baseline
         )
-        for metric in config.metrics:
-            minimum = int(resolve_metric_policy(metric)["minimum_standard_points"])
-            if len(self.standard.get(metric, TimeSeries())) < minimum:
-                raise ValueError(
-                    f"standard log has fewer than {minimum} points for {metric!r}"
+        if runner is None:
+            if config.policy_config is None:
+                self.runner = BaselineDetectionRunner(
+                    self.baseline,
+                    metrics=config.metrics,
+                    task_id=config.task_id,
                 )
+            else:
+                policy = load_algorithm_policy_config(config.policy_config)
+                self.runner = BaselineDetectionRunner(
+                    self.baseline,
+                    metrics=config.metrics,
+                    task_id=config.task_id,
+                    metric_policies=policy.for_metrics(config.metrics),
+                    history_policy=policy.history_policy,
+                )
+        else:
+            self.runner = runner
+        requirements = self.runner.minimum_inference_samples()
+        for metric in config.metrics:
+            minimum = requirements.get(metric)
+            if (
+                isinstance(minimum, bool)
+                or not isinstance(minimum, int)
+                or minimum <= 0
+            ):
+                raise ValueError(
+                    f"invalid minimum inference sample count for {metric!r}"
+                )
+            if minimum > config.inference_window_steps:
+                raise ValueError(
+                    "inference_window_steps is smaller than the required "
+                    f"{minimum} samples for {metric!r}"
+                )
+        self._minimum_samples = requirements
+        self._standard_samples = {
+            metric: _standard_sample_count(self.baseline, metric)
+            for metric in config.metrics
+        }
         self.reader = reader or ParamikoRemoteLogReader(config.remote)
-        self.state = MonitorState(
-            inference_buffer={metric: TimeSeries() for metric in config.metrics}
+        self.state = _load_monitor_state(
+            config.state_file,
+            remote_log_path=config.remote.log_path,
+            metrics=config.metrics,
+            window_steps=config.inference_window_steps,
         )
         self._now = now or (lambda: datetime.now(timezone.utc))
 
+    def _commit_state(self, state: MonitorState) -> None:
+        _save_monitor_state_atomically(
+            state,
+            self.config.state_file,
+            remote_log_path=self.config.remote.log_path,
+            metrics=self.config.metrics,
+        )
+
     def poll_once(self) -> PollOutcome:
-        """Read one snapshot; call the detector only for a complete new batch."""
+        """Read one snapshot and transactionally process only new steps."""
 
         try:
             snapshot = self.reader.read_snapshot()
@@ -379,51 +717,84 @@ class RemoteMonitor:
         if not new_steps:
             return PollOutcome(status="no_new_data")
 
-        candidate = {
+        merged = {
             metric: _merge_series(
                 self.state.inference_buffer.get(metric, TimeSeries()),
                 new_series[metric],
             )
             for metric in self.config.metrics
         }
-        candidate_steps = sorted(set([*self.state.buffered_steps, *new_steps]))
-        new_last_step = max(new_steps)
-        requirements = self.runner.minimum_inference_samples()
+        candidate_buffer, candidate_steps = _trim_to_window(
+            merged,
+            self.config.inference_window_steps,
+        )
+        candidate = MonitorState(
+            last_step=max(new_steps),
+            inference_buffer=candidate_buffer,
+            buffered_steps=candidate_steps,
+            round_id=self.state.round_id,
+        )
         enough = all(
-            len(candidate.get(metric, TimeSeries())) >= requirements[metric]
+            len(candidate_buffer.get(metric, TimeSeries()))
+            >= self._minimum_samples[metric]
             for metric in self.config.metrics
         )
         if not enough:
-            self.state.inference_buffer = candidate
-            self.state.buffered_steps = candidate_steps
-            self.state.last_step = new_last_step
+            try:
+                self._commit_state(candidate)
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:
+                return PollOutcome(
+                    status="error",
+                    error={"type": type(exc).__name__, "message": str(exc)},
+                )
+            self.state = candidate
             return PollOutcome(status="waiting_for_data")
 
         before = self.state.last_step
         new_range = _step_range(new_steps)
         buffer_range = _step_range(candidate_steps)
         assert new_range is not None and buffer_range is not None
+        runtime_snapshot: Any = None
+        snapshot_taken = False
         try:
-            result = self.runner.run(candidate)
+            runtime_snapshot = self.runner.snapshot_runtime_state()
+            snapshot_taken = True
+            result = self.runner.run(_copy_buffer(candidate_buffer))
+            next_round = self.state.round_id + 1
+            candidate.round_id = next_round
             result["metadata"] = {
                 "schemaVersion": 1,
                 "mode": "ssh-polling",
-                "roundId": self.state.round_id + 1,
+                "roundId": next_round,
                 "detectedAt": self._now().astimezone(timezone.utc).isoformat(),
-                "sourceType": "training_log",
+                "sourceType": _baseline_identity(
+                    self.baseline,
+                    "source_type",
+                    "training_log",
+                ),
+                "baselineId": _baseline_identity(
+                    self.baseline,
+                    "baseline_id",
+                    "default",
+                ),
                 "newStepRange": new_range,
                 "bufferStepRange": buffer_range,
                 "lastStepBefore": before,
-                "lastStepAfter": new_last_step,
+                "lastStepAfter": candidate.last_step,
                 "selectedMetrics": list(self.config.metrics),
                 "perMetricPointCounts": {
                     metric: {
-                        "standard": len(self.standard.get(metric, TimeSeries())),
-                        "inference": len(candidate.get(metric, TimeSeries())),
+                        "standard": self._standard_samples[metric],
+                        "inference": len(
+                            candidate_buffer.get(metric, TimeSeries())
+                        ),
                     }
                     for metric in self.config.metrics
                 },
                 "pollIntervalSeconds": self.config.poll_interval_seconds,
+                "inferenceWindowSteps": self.config.inference_window_steps,
                 "errors": [],
             }
             output = _save_result_atomically(
@@ -432,20 +803,32 @@ class RemoteMonitor:
                 self.config.task_id,
                 buffer_range,
             )
+            self._commit_state(candidate)
         except KeyboardInterrupt:
+            if snapshot_taken:
+                self.runner.restore_runtime_state(runtime_snapshot)
             raise
         except Exception as exc:
+            if snapshot_taken:
+                try:
+                    self.runner.restore_runtime_state(runtime_snapshot)
+                except Exception as rollback_exc:
+                    return PollOutcome(
+                        status='error',
+                        error={
+                            'type': type(rollback_exc).__name__,
+                            'message': (
+                                f'{exc}; detector rollback failed: '
+                                f'{rollback_exc}'
+                            ),
+                        },
+                    )
             return PollOutcome(
                 status="error",
                 error={"type": type(exc).__name__, "message": str(exc)},
             )
 
-        self.state.last_step = new_last_step
-        self.state.inference_buffer = {
-            metric: TimeSeries() for metric in self.config.metrics
-        }
-        self.state.buffered_steps = []
-        self.state.round_id += 1
+        self.state = candidate
         return PollOutcome(status="detected", result=result, output_path=output)
 
     def run_forever(
@@ -459,6 +842,7 @@ class RemoteMonitor:
             outcome = self.poll_once()
             polls += 1
             if outcome.status == "error":
+                assert outcome.error is not None
                 sys.stderr.write(
                     f"poll error: {outcome.error['type']}: "
                     f"{outcome.error['message']}\n"
@@ -472,7 +856,9 @@ class RemoteMonitor:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m experiment.degradation_perception.remote_monitor",
-        description="Poll a remote VeRL .log over SSH and detect completed batches.",
+        description=(
+            "Poll a remote VeRL .log over SSH and detect with a saved baseline."
+        ),
     )
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument(

@@ -256,6 +256,14 @@ def _display_number(value: Any) -> str:
         return str(value)
 
 
+def _display_event_time(value: Any) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return str(value)
+    return str(int(number)) if number.is_integer() else str(number)
+
+
 def format_terminal_summary(
     result: Mapping[str, Any],
     *,
@@ -330,6 +338,27 @@ def format_terminal_summary(
                 f"{details.get('abnormalIntervalCount', 0)}",
             ]
         )
+    if "abnormalMetrics" in result:
+        abnormal_metrics = result.get("abnormalMetrics")
+        if isinstance(abnormal_metrics, list) and abnormal_metrics:
+            lines.extend(["", "Abnormal metrics:", ""])
+            for metric_entry in abnormal_metrics:
+                if not isinstance(metric_entry, Mapping):
+                    continue
+                lines.append(str(metric_entry.get("metric", "")))
+                events = metric_entry.get("events", [])
+                if not isinstance(events, list):
+                    continue
+                for event in events:
+                    if not isinstance(event, Mapping):
+                        continue
+                    lines.append(
+                        f"  event {event.get('eventIndex')}: "
+                        f"{_display_event_time(event.get('startTime'))} -> "
+                        f"{_display_event_time(event.get('endTime'))}"
+                    )
+        else:
+            lines.extend(["", "No abnormal metrics detected."])
     return "\n".join(lines) + "\n"
 
 

@@ -77,6 +77,7 @@ class DetectionResult(_DetectionResultRequired, total=False):
 
     metricErrors: dict[str, dict[str, str]]
     associationAnalysis: dict[str, Any]
+    abnormalMetrics: list[dict[str, Any]]
 
 
 DEFAULT_METRIC = "timing_s/step"
