@@ -146,6 +146,55 @@ python -m experiment.degradation_perception.remote_monitor \
 恢复 `lastStep` 和未完成缓冲。SSH、检测或写盘失败会记录错误并等待下一轮；失败
 轮次不会提交候选状态。在线模式不需要也不会读取 `healthy.log`，远端文件只读。
 
+## 4. Prometheus 轮询与自动基线
+
+Prometheus 模式是已有 Prometheus HTTP API 的只读客户端，不会启动新端口。复制并
+修改示例配置，确保每条 PromQL 通过 `project`、`experiment_name`、`job`、
+`instance` 等标签唯一定位一条时序；如果确实需要合并副本，请在 PromQL 中显式
+使用 `sum`、`avg` 等聚合：
+
+```bash
+cp experiment/degradation_perception/prometheus_monitor_config.example.yaml \
+  prometheus_monitor_config.yaml
+cp experiment/degradation_perception/algorithm_config.yaml algorithm_config.yaml
+```
+
+先执行一轮真实连接和数据检查：
+
+```bash
+python -m experiment.degradation_perception.prometheus_monitor \
+  --config prometheus_monitor_config.yaml \
+  --once
+```
+
+持续轮询：
+
+```bash
+python -m experiment.degradation_perception.prometheus_monitor \
+  --config prometheus_monitor_config.yaml
+```
+
+`poll_interval_seconds` 默认是 180 秒，只控制多久发起一次请求；
+`prometheus.query_step_seconds` 默认是 15 秒，控制每次 `query_range` 返回的采样
+网格。每轮会从上次游标向前重叠两个采样间隔并按时间戳去重，不能把 query step
+设置成三分钟。
+
+如果 `baseline_model` 不存在，监控器会在 `lookback_seconds` 范围内查询
+`global_step_query`，默认将 global step 5 至 25 各取一个对齐样本，完成覆盖率、
+样本数和平稳段检查后调用现有 `fit_baseline_model`。生成的基线随即冻结，后续
+inference 不会更新它。基线已存在时直接加载，不会重新拟合。
+
+指标名称不区分大小写地包含 `time` 或 `timing` 时默认作为 target，其余指标默认
+作为 association candidate。配置中的 `role` 或 `target_selection.overrides` 可以
+显式覆盖。每次检测都会原子覆盖 `<task_id>_latest.json`；只有 target 在 NORMAL、
+ABNORMAL、RECOVERED 之间发生状态变化时，才会额外生成带稳定 event ID 的
+`event_*.json`，因此相同故障不会每三分钟重复上报。
+
+状态文件同时绑定 Prometheus 查询配置指纹和 baseline SHA-256。修改指标查询、
+target 规则、基线 step 范围或替换基线后，需要移动或删除旧状态文件；修改轮询
+周期或输出目录不要求重新训练基线。认证信息只能通过配置中指定的环境变量读取，
+不要把 token 或密码写入 YAML。
+
 ## 算法与输出
 
 ```text
