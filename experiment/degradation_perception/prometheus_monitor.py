@@ -12,13 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Poll Prometheus and reuse the existing immutable-baseline detector."""
+"""Minimal Prometheus discovery, training, detection, and analysis CLI."""
 
 from __future__ import annotations
 
 import argparse
 import copy
-import hashlib
 import json
 import math
 import os
@@ -26,30 +25,31 @@ import re
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable
 
 import yaml
 
 from .algorithm_policy import (
+    DEFAULT_ALGORITHM_POLICY_PATH,
     AlgorithmPolicyConfig,
     load_algorithm_policy_config,
 )
 from .baseline_model import (
     BaselineDetectionRunner,
     BaselineModelFile,
-    baseline_model_sha256,
+    MetricBaseline,
+    baseline_model_from_dict,
     fit_baseline_model,
-    load_baseline_model,
-    save_baseline_model,
 )
 from .perception_config import TimeSeries
+from .policy import resolve_metric_policy
 from .prometheus_source import (
     PrometheusHttpClient,
-    PrometheusMetricQuery,
+    PrometheusSeries,
     build_bootstrap_window,
     filter_after_global_step,
     latest_integer_step,
@@ -57,93 +57,15 @@ from .prometheus_source import (
 from .serialization import to_json_serializable
 
 
-@dataclass(frozen=True)
-class PrometheusConnectionConfig:
-    url: str
-    global_step_query: str
-    query_step_seconds: float = 15.0
-    lookback_seconds: float = 86400.0
-    overlap_seconds: float = 30.0
-    alignment_tolerance_seconds: float = 8.0
-    timeout_seconds: float = 30.0
-    verify_tls: bool = True
-    bearer_token_env: str | None = None
-    username_env: str | None = None
-    password_env: str | None = None
+TRAINING_SCHEMA_VERSION = 1
+RESULT_SCHEMA_VERSION = 1
 
 
-@dataclass(frozen=True)
-class BaselineBootstrapConfig:
-    auto_fit: bool = True
-    start_step: int = 5
-    end_step: int = 25
-    minimum_samples_per_metric: int = 10
-    minimum_step_coverage_ratio: float = 0.5
-    baseline_id: str | None = None
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
-@dataclass(frozen=True)
-class TargetSelectionConfig:
-    patterns: tuple[str, ...] = ("time", "timing")
-    case_sensitive: bool = False
-    unmatched_role: str = "candidate"
-    overrides: dict[str, str] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class PrometheusMonitorConfig:
-    baseline_model: Path
-    policy_config: Path
-    prometheus: PrometheusConnectionConfig
-    queries: tuple[PrometheusMetricQuery, ...]
-    target_metrics: tuple[str, ...]
-    candidate_metrics: tuple[str, ...]
-    baseline: BaselineBootstrapConfig
-    target_selection: TargetSelectionConfig
-    poll_interval_seconds: float
-    inference_window_points: int
-    state_file: Path
-    output_dir: Path
-    task_id: str
-
-    @property
-    def metrics(self) -> tuple[str, ...]:
-        return tuple(query.name for query in self.queries)
-
-
-@dataclass
-class PrometheusMonitorState:
-    last_timestamp: float | None = None
-    last_global_step: int | None = None
-    inference_buffer: dict[str, TimeSeries] = field(default_factory=dict)
-    round_id: int = 0
-    active_event_ids: dict[str, str] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class PrometheusPollOutcome:
-    status: str
-    result: dict[str, Any] | None = None
-    output_path: Path | None = None
-    event_path: Path | None = None
-    error: dict[str, str] | None = None
-
-
-class DetectionRunner(Protocol):
-    def minimum_inference_samples(self) -> dict[str, int]: ...
-
-    def snapshot_runtime_state(self) -> Any: ...
-
-    def restore_runtime_state(self, snapshot: Any) -> None: ...
-
-    def run(self, inference: Mapping[str, TimeSeries]) -> dict[str, Any]: ...
-
-
-_ROLES = {"auto", "target", "candidate", "ignore"}
-_ABNORMAL_TYPES = {"UP", "DOWN", "BOTH"}
-
-
-def _required_text(value: Any, name: str) -> str:
+def _text(value: Any, name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} must be a non-empty string")
     return value.strip()
@@ -151,14 +73,14 @@ def _required_text(value: Any, name: str) -> str:
 
 def _positive_float(value: Any, name: str) -> float:
     if isinstance(value, bool):
-        raise TypeError(f"{name} must be a positive number")
+        raise ValueError(f"{name} must be a positive number")
     try:
-        result = float(value)
+        number = float(value)
     except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(f"{name} must be a positive number") from exc
-    if not math.isfinite(result) or result <= 0:
+    if not math.isfinite(number) or number <= 0:
         raise ValueError(f"{name} must be a positive number")
-    return result
+    return number
 
 
 def _positive_int(value: Any, name: str) -> int:
@@ -167,1038 +89,835 @@ def _positive_int(value: Any, name: str) -> int:
     return value
 
 
-def _boolean(value: Any, name: str) -> bool:
-    if not isinstance(value, bool):
-        raise TypeError(f"{name} must be a boolean")
-    return value
+def _patterns(value: Any, name: str, default: Sequence[str]) -> tuple[str, ...]:
+    raw = list(default) if value is None else value
+    if not isinstance(raw, list) or not raw:
+        raise ValueError(f"{name} must be a non-empty list")
+    result = tuple(_text(item, name).casefold() for item in raw)
+    return tuple(dict.fromkeys(result))
 
 
-def _mapping(value: Any, name: str) -> dict[str, Any]:
-    if not isinstance(value, Mapping):
-        raise TypeError(f"{name} must be an object")
-    return dict(value)
+def _path(value: Any, name: str, *, base: Path) -> Path:
+    path = Path(_text(value, name)).expanduser()
+    return path.resolve() if path.is_absolute() else (base / path).resolve()
 
 
-def _reject_unknown(
-    raw: Mapping[str, Any],
-    allowed: set[str],
-    name: str,
-) -> None:
-    unknown = sorted(set(raw) - allowed)
-    if unknown:
-        raise ValueError(f"{name} contains unsupported fields: {', '.join(unknown)}")
+@dataclass(frozen=True)
+class MonitorConfig:
+    """Small YAML-owned surface for the experiment runtime."""
+
+    prometheus_url: str
+    series_selector: str
+    query_step_seconds: float
+    lookback_seconds: float
+    alignment_tolerance_seconds: float
+    timeout_seconds: float
+    verify_tls: bool
+    baseline_start_step: int
+    baseline_end_step: int
+    minimum_baseline_samples: int
+    inference_points: int
+    poll_interval_seconds: float
+    top_k: int
+    target_patterns: tuple[str, ...]
+    global_step_patterns: tuple[str, ...]
+    algorithm_config: Path
+    output_dir: Path
+
+    @property
+    def query_file(self) -> Path:
+        return self.output_dir / "query.json"
+
+    @property
+    def training_file(self) -> Path:
+        return self.output_dir / "training.json"
+
+    @property
+    def result_file(self) -> Path:
+        return self.output_dir / "anomalies.json"
 
 
-def _optional_env_name(value: Any, name: str) -> str | None:
-    return None if value is None else _required_text(value, name)
-
-
-def _local_path(base: Path, value: Any, name: str) -> Path:
-    raw = Path(_required_text(value, name)).expanduser()
-    return raw.resolve() if raw.is_absolute() else (base / raw).resolve()
-
-
-def _resolve_role(
-    metric: str,
-    configured_role: str,
-    selection: TargetSelectionConfig,
-) -> str:
-    if configured_role != "auto":
-        return configured_role
-    if metric in selection.overrides:
-        return selection.overrides[metric]
-    candidate = metric if selection.case_sensitive else metric.lower()
-    patterns = (
-        selection.patterns
-        if selection.case_sensitive
-        else tuple(pattern.lower() for pattern in selection.patterns)
-    )
-    if any(pattern in candidate for pattern in patterns):
-        return "target"
-    return selection.unmatched_role
-
-
-def load_prometheus_monitor_config(path: str | Path) -> PrometheusMonitorConfig:
-    """Load the Prometheus runtime YAML without changing algorithm policy."""
+def load_config(path: str | Path) -> MonitorConfig:
+    """Load the one intentionally small runtime YAML file."""
 
     source = Path(path).expanduser().resolve()
     try:
         raw = yaml.safe_load(source.read_text(encoding="utf-8")) or {}
     except (OSError, UnicodeError, yaml.YAMLError) as exc:
-        raise ValueError(f"could not load Prometheus monitor config: {exc}") from exc
-    root = _mapping(raw, "Prometheus monitor config root")
-    _reject_unknown(
-        root,
-        {
-            "baseline_model",
-            "policy_config",
-            "prometheus",
-            "metrics",
-            "target_selection",
-            "baseline",
-            "poll_interval_seconds",
-            "inference_window_points",
-            "state_file",
-            "output_dir",
-            "task_id",
-        },
-        "Prometheus monitor config",
-    )
+        raise ValueError(f"could not load config {source}: {exc}") from exc
+    if not isinstance(raw, Mapping):
+        raise ValueError("config root must be an object")
     base = source.parent
 
-    prom_raw = _mapping(root.get("prometheus"), "prometheus")
-    _reject_unknown(
-        prom_raw,
-        {
-            "url",
-            "global_step_query",
-            "query_step_seconds",
-            "lookback_seconds",
-            "overlap_seconds",
-            "alignment_tolerance_seconds",
-            "timeout_seconds",
-            "verify_tls",
-            "bearer_token_env",
-            "username_env",
-            "password_env",
-        },
-        "prometheus",
-    )
-    query_step = _positive_float(
-        prom_raw.get("query_step_seconds", 15),
-        "prometheus.query_step_seconds",
-    )
-    prometheus = PrometheusConnectionConfig(
-        url=_required_text(prom_raw.get("url"), "prometheus.url"),
-        global_step_query=_required_text(
-            prom_raw.get("global_step_query"),
-            "prometheus.global_step_query",
+    baseline_steps = raw.get("baseline_steps", [5, 25])
+    if (
+        not isinstance(baseline_steps, list)
+        or len(baseline_steps) != 2
+        or any(isinstance(item, bool) or not isinstance(item, int) for item in baseline_steps)
+    ):
+        raise ValueError("baseline_steps must be [start_step, end_step]")
+    start_step, end_step = baseline_steps
+    if start_step > end_step:
+        raise ValueError("baseline_steps start must not exceed end")
+    verify_tls = raw.get("verify_tls", True)
+    if not isinstance(verify_tls, bool):
+        raise ValueError("verify_tls must be true or false")
+
+    return MonitorConfig(
+        prometheus_url=_text(
+            raw.get("prometheus_url", "http://127.0.0.1:9090"),
+            "prometheus_url",
+        ).rstrip("/"),
+        series_selector=_text(
+            raw.get("series_selector", '{__name__=~".+"}'),
+            "series_selector",
         ),
-        query_step_seconds=query_step,
+        query_step_seconds=_positive_float(
+            raw.get("query_step_seconds", 10), "query_step_seconds"
+        ),
         lookback_seconds=_positive_float(
-            prom_raw.get("lookback_seconds", 86400),
-            "prometheus.lookback_seconds",
-        ),
-        overlap_seconds=_positive_float(
-            prom_raw.get("overlap_seconds", query_step * 2),
-            "prometheus.overlap_seconds",
+            raw.get("lookback_seconds", 86400), "lookback_seconds"
         ),
         alignment_tolerance_seconds=_positive_float(
-            prom_raw.get("alignment_tolerance_seconds", query_step / 2 + 0.5),
-            "prometheus.alignment_tolerance_seconds",
+            raw.get("alignment_tolerance_seconds", 6),
+            "alignment_tolerance_seconds",
         ),
         timeout_seconds=_positive_float(
-            prom_raw.get("timeout_seconds", 30),
-            "prometheus.timeout_seconds",
+            raw.get("timeout_seconds", 30), "timeout_seconds"
         ),
-        verify_tls=_boolean(
-            prom_raw.get("verify_tls", True),
-            "prometheus.verify_tls",
+        verify_tls=verify_tls,
+        baseline_start_step=start_step,
+        baseline_end_step=end_step,
+        minimum_baseline_samples=_positive_int(
+            raw.get("minimum_baseline_samples", 10),
+            "minimum_baseline_samples",
         ),
-        bearer_token_env=_optional_env_name(
-            prom_raw.get("bearer_token_env"),
-            "prometheus.bearer_token_env",
+        inference_points=_positive_int(
+            raw.get("inference_points", 120), "inference_points"
         ),
-        username_env=_optional_env_name(
-            prom_raw.get("username_env"),
-            "prometheus.username_env",
-        ),
-        password_env=_optional_env_name(
-            prom_raw.get("password_env"),
-            "prometheus.password_env",
-        ),
-    )
-    if prometheus.overlap_seconds < prometheus.query_step_seconds:
-        raise ValueError(
-            "prometheus.overlap_seconds must be at least query_step_seconds"
-        )
-
-    selection_raw = _mapping(
-        root.get("target_selection", {}),
-        "target_selection",
-    )
-    _reject_unknown(
-        selection_raw,
-        {"patterns", "case_sensitive", "unmatched_role", "overrides"},
-        "target_selection",
-    )
-    patterns_raw = selection_raw.get("patterns", ["time", "timing"])
-    if not isinstance(patterns_raw, Sequence) or isinstance(patterns_raw, (str, bytes)):
-        raise TypeError("target_selection.patterns must be an array")
-    patterns = tuple(
-        _required_text(item, "target_selection.patterns[]") for item in patterns_raw
-    )
-    if not patterns:
-        raise ValueError("target_selection.patterns must not be empty")
-    unmatched_role = _required_text(
-        selection_raw.get("unmatched_role", "candidate"),
-        "target_selection.unmatched_role",
-    ).lower()
-    if unmatched_role not in {"candidate", "ignore"}:
-        raise ValueError("target_selection.unmatched_role must be candidate or ignore")
-    overrides_raw = _mapping(
-        selection_raw.get("overrides", {}),
-        "target_selection.overrides",
-    )
-    overrides: dict[str, str] = {}
-    for metric, role_value in overrides_raw.items():
-        metric_name = _required_text(metric, "target_selection override metric")
-        role = _required_text(
-            role_value,
-            f"target_selection.overrides.{metric_name}",
-        ).lower()
-        if role not in {"target", "candidate", "ignore"}:
-            raise ValueError(
-                f"target_selection override for {metric_name!r} must be "
-                "target, candidate, or ignore"
-            )
-        overrides[metric_name] = role
-    selection = TargetSelectionConfig(
-        patterns=patterns,
-        case_sensitive=_boolean(
-            selection_raw.get("case_sensitive", False),
-            "target_selection.case_sensitive",
-        ),
-        unmatched_role=unmatched_role,
-        overrides=overrides,
-    )
-
-    metrics_raw = _mapping(root.get("metrics"), "metrics")
-    if not metrics_raw:
-        raise ValueError("metrics must contain at least one query")
-    queries: list[PrometheusMetricQuery] = []
-    targets: list[str] = []
-    candidates: list[str] = []
-    for raw_name, raw_spec in metrics_raw.items():
-        name = _required_text(raw_name, "metric name")
-        if isinstance(raw_spec, str):
-            spec = {"promql": raw_spec}
-        else:
-            spec = _mapping(raw_spec, f"metrics.{name}")
-        _reject_unknown(
-            spec,
-            {"promql", "role", "abnormal_type"},
-            f"metrics.{name}",
-        )
-        configured_role = _required_text(
-            spec.get("role", "auto"),
-            f"metrics.{name}.role",
-        ).lower()
-        if configured_role not in _ROLES:
-            raise ValueError(
-                f"metrics.{name}.role must be auto, target, candidate, or ignore"
-            )
-        role = _resolve_role(name, configured_role, selection)
-        if role == "ignore":
-            continue
-        abnormal_type_raw = spec.get("abnormal_type")
-        abnormal_type = None
-        if abnormal_type_raw is not None:
-            abnormal_type = _required_text(
-                abnormal_type_raw,
-                f"metrics.{name}.abnormal_type",
-            ).upper()
-            if abnormal_type not in _ABNORMAL_TYPES:
-                raise ValueError(
-                    f"metrics.{name}.abnormal_type must be UP, DOWN, or BOTH"
-                )
-        queries.append(
-            PrometheusMetricQuery(
-                name=name,
-                promql=_required_text(
-                    spec.get("promql"),
-                    f"metrics.{name}.promql",
-                ),
-                role=role,
-                abnormal_type=abnormal_type,
-            )
-        )
-        (targets if role == "target" else candidates).append(name)
-    if not queries:
-        raise ValueError("all configured metrics are ignored")
-    if not targets:
-        raise ValueError(
-            "no target metric matched target_selection; configure a time/timing "
-            "metric or an explicit target override"
-        )
-
-    baseline_raw = _mapping(root.get("baseline", {}), "baseline")
-    _reject_unknown(
-        baseline_raw,
-        {
-            "auto_fit",
-            "start_step",
-            "end_step",
-            "minimum_samples_per_metric",
-            "minimum_step_coverage_ratio",
-            "baseline_id",
-        },
-        "baseline",
-    )
-    start_step = baseline_raw.get("start_step", 5)
-    end_step = baseline_raw.get("end_step", 25)
-    if isinstance(start_step, bool) or not isinstance(start_step, int):
-        raise TypeError("baseline.start_step must be an integer")
-    if isinstance(end_step, bool) or not isinstance(end_step, int):
-        raise TypeError("baseline.end_step must be an integer")
-    if start_step > end_step:
-        raise ValueError("baseline.start_step must not exceed baseline.end_step")
-    coverage = baseline_raw.get("minimum_step_coverage_ratio", 0.5)
-    if isinstance(coverage, bool):
-        raise TypeError("baseline.minimum_step_coverage_ratio must be between 0 and 1")
-    try:
-        coverage_number = float(coverage)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(
-            "baseline.minimum_step_coverage_ratio must be between 0 and 1"
-        ) from exc
-    if not math.isfinite(coverage_number) or not 0 < coverage_number <= 1:
-        raise ValueError("baseline.minimum_step_coverage_ratio must be between 0 and 1")
-    baseline_id_raw = baseline_raw.get("baseline_id")
-    baseline = BaselineBootstrapConfig(
-        auto_fit=_boolean(
-            baseline_raw.get("auto_fit", True),
-            "baseline.auto_fit",
-        ),
-        start_step=start_step,
-        end_step=end_step,
-        minimum_samples_per_metric=_positive_int(
-            baseline_raw.get("minimum_samples_per_metric", 10),
-            "baseline.minimum_samples_per_metric",
-        ),
-        minimum_step_coverage_ratio=coverage_number,
-        baseline_id=(
-            None
-            if baseline_id_raw is None
-            else _required_text(baseline_id_raw, "baseline.baseline_id")
-        ),
-    )
-    return PrometheusMonitorConfig(
-        baseline_model=_local_path(
-            base,
-            root.get("baseline_model"),
-            "baseline_model",
-        ),
-        policy_config=_local_path(
-            base,
-            root.get("policy_config", "./algorithm_config.yaml"),
-            "policy_config",
-        ),
-        prometheus=prometheus,
-        queries=tuple(queries),
-        target_metrics=tuple(targets),
-        candidate_metrics=tuple(candidates),
-        baseline=baseline,
-        target_selection=selection,
         poll_interval_seconds=_positive_float(
-            root.get("poll_interval_seconds", 180),
-            "poll_interval_seconds",
+            raw.get("poll_interval_seconds", 180), "poll_interval_seconds"
         ),
-        inference_window_points=_positive_int(
-            root.get("inference_window_points", 100),
-            "inference_window_points",
+        top_k=_positive_int(raw.get("top_k", 5), "top_k"),
+        target_patterns=_patterns(
+            raw.get("target_patterns"), "target_patterns", ("time", "timing")
         ),
-        state_file=_local_path(
-            base,
-            root.get("state_file", "./prometheus_output/monitor_state.json"),
-            "state_file",
+        global_step_patterns=_patterns(
+            raw.get("global_step_patterns"),
+            "global_step_patterns",
+            ("global_step",),
         ),
-        output_dir=_local_path(
-            base,
-            root.get("output_dir", "./prometheus_output"),
-            "output_dir",
+        algorithm_config=_path(
+            raw.get("algorithm_config", str(DEFAULT_ALGORITHM_POLICY_PATH)),
+            "algorithm_config",
+            base=base,
         ),
-        task_id=_required_text(
-            root.get("task_id", "degradation-prometheus"), "task_id"
-        ),
+        output_dir=_path(raw.get("output_dir", "./output"), "output_dir", base=base),
     )
+
+
+@dataclass(frozen=True)
+class SeriesSpec:
+    """Concrete Prometheus series plus its algorithm role."""
+
+    series: PrometheusSeries
+    role: str
+
+    @property
+    def identifier(self) -> str:
+        return self.series.identifier
+
+    def to_dict(self) -> dict[str, Any]:
+        result = self.series.to_dict()
+        result["role"] = self.role
+        return result
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> "SeriesSpec":
+        if not isinstance(raw, Mapping):
+            raise ValueError("training series entry must be an object")
+        metric_name = _text(raw.get("metricName"), "series.metricName")
+        labels_raw = raw.get("labels", {})
+        if not isinstance(labels_raw, Mapping) or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in labels_raw.items()
+        ):
+            raise ValueError("series.labels must be string pairs")
+        role = _text(raw.get("role"), "series.role")
+        if role not in {"global_step", "target", "candidate"}:
+            raise ValueError(f"unsupported series role: {role!r}")
+        return cls(
+            PrometheusSeries(metric_name, dict(labels_raw)),
+            role,
+        )
+
+
+def _role(series: PrometheusSeries, config: MonitorConfig) -> str:
+    name = series.metric_name.casefold()
+    if any(pattern in name for pattern in config.global_step_patterns):
+        return "global_step"
+    if any(pattern in name for pattern in config.target_patterns):
+        return "target"
+    return "candidate"
 
 
 def _metric_policies(
     policy: AlgorithmPolicyConfig,
-    queries: Sequence[PrometheusMetricQuery],
+    specs: Sequence[SeriesSpec],
+    *,
+    top_k: int,
 ) -> dict[str, dict[str, Any]]:
-    policies = policy.for_metrics([query.name for query in queries])
-    for query in queries:
-        if query.abnormal_type is not None:
-            policies[query.name]["abnormal_type"] = query.abnormal_type
+    policies = policy.for_metrics([spec.identifier for spec in specs])
+    for spec in specs:
+        metric_policy = policies[spec.identifier]
+        if spec.role == "candidate":
+            metric_policy["abnormal_type"] = "BOTH"
+        association = copy.deepcopy(metric_policy.get("association", {}))
+        association["top_k"] = top_k
+        metric_policy["association"] = association
     return policies
 
 
-def _source_fingerprint(config: PrometheusMonitorConfig) -> str:
-    payload = {
-        "url": config.prometheus.url,
-        "globalStepQuery": config.prometheus.global_step_query,
-        "queryStepSeconds": config.prometheus.query_step_seconds,
-        "alignmentToleranceSeconds": (config.prometheus.alignment_tolerance_seconds),
-        "queries": [
-            {
-                "name": query.name,
-                "promql": query.promql,
-                "role": query.role,
-                "abnormalType": query.abnormal_type,
-            }
-            for query in config.queries
-        ],
-        "targets": list(config.target_metrics),
-        "baselineSteps": [config.baseline.start_step, config.baseline.end_step],
-    }
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
-
-def _copy_series(series: TimeSeries) -> TimeSeries:
-    return TimeSeries(list(series.timestamps), list(series.values))
-
-
-def _copy_buffer(buffer: Mapping[str, TimeSeries]) -> dict[str, TimeSeries]:
-    return {metric: _copy_series(series) for metric, series in buffer.items()}
-
-
-def _merge_series(left: TimeSeries, right: TimeSeries) -> TimeSeries:
-    points = {
-        float(timestamp): float(value)
-        for timestamp, value in zip(left.timestamps, left.values)
-    }
-    points.update(
-        {
-            float(timestamp): float(value)
-            for timestamp, value in zip(right.timestamps, right.values)
-        }
-    )
-    ordered = sorted(points.items())
-    return TimeSeries(
-        timestamps=[timestamp for timestamp, _ in ordered],
-        values=[value for _, value in ordered],
-    )
-
-
-def _trim_buffer(
-    buffer: Mapping[str, TimeSeries],
-    maximum_points: int,
-) -> dict[str, TimeSeries]:
-    result: dict[str, TimeSeries] = {}
-    for metric, series in buffer.items():
-        start = max(0, len(series) - maximum_points)
-        result[metric] = TimeSeries(
-            timestamps=list(series.timestamps[start:]),
-            values=list(series.values[start:]),
-        )
-    return result
-
-
-def _safe_task_name(task_id: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_.-]+", "_", task_id).strip("._") or "task"
-
-
-def _write_json_atomically(destination: Path, payload: Mapping[str, Any]) -> Path:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    serialized = (
-        json.dumps(
-            to_json_serializable(dict(payload)),
-            ensure_ascii=False,
-            allow_nan=False,
-            indent=2,
-        )
-        + "\n"
-    )
-    temporary_name: str | None = None
+def _write_json(path: Path, payload: Any) -> Path:
+    serialized = json.dumps(
+        to_json_serializable(payload),
+        ensure_ascii=False,
+        allow_nan=False,
+        indent=2,
+    ) + "\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: str | None = None
     try:
         with tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
-            newline="\n",
-            prefix=destination.name + ".",
+            dir=path.parent,
+            prefix=path.name + ".",
             suffix=".tmp",
-            dir=destination.parent,
             delete=False,
-        ) as temporary:
-            temporary.write(serialized)
-            temporary.flush()
-            os.fsync(temporary.fileno())
-            temporary_name = temporary.name
-        os.replace(temporary_name, destination)
-        temporary_name = None
-        return destination
+        ) as handle:
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+            temporary = handle.name
+        os.replace(temporary, path)
+        temporary = None
+        return path
     finally:
-        if temporary_name is not None:
+        if temporary is not None:
             try:
-                Path(temporary_name).unlink()
+                Path(temporary).unlink()
             except FileNotFoundError:
                 pass
 
 
-def _state_payload(
-    state: PrometheusMonitorState,
-    *,
-    metrics: Sequence[str],
-    source_fingerprint: str,
-    baseline_sha256: str,
-) -> dict[str, Any]:
-    return {
-        "schemaVersion": 1,
-        "sourceFingerprint": source_fingerprint,
-        "baselineSha256": baseline_sha256,
-        "lastTimestamp": state.last_timestamp,
-        "lastGlobalStep": state.last_global_step,
-        "roundId": state.round_id,
-        "activeEventIds": dict(state.active_event_ids),
-        "inferenceBuffer": {
-            metric: {
-                "timestamps": list(
-                    state.inference_buffer.get(metric, TimeSeries()).timestamps
-                ),
-                "values": list(state.inference_buffer.get(metric, TimeSeries()).values),
-            }
-            for metric in metrics
-        },
-    }
-
-
-def _load_state(
-    path: Path,
-    *,
-    metrics: Sequence[str],
-    source_fingerprint: str,
-    baseline_sha256_value: str,
-    window_points: int,
-) -> PrometheusMonitorState:
-    empty = {metric: TimeSeries() for metric in metrics}
-    if not path.exists():
-        return PrometheusMonitorState(inference_buffer=empty)
+def _read_json(path: Path, name: str) -> dict[str, Any]:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise ValueError(f"could not load Prometheus monitor state: {exc}") from exc
-    root = _mapping(raw, "Prometheus monitor state")
-    if root.get("schemaVersion") != 1:
-        raise ValueError("unsupported Prometheus monitor state schemaVersion")
-    if root.get("sourceFingerprint") != source_fingerprint:
-        raise ValueError(
-            "Prometheus monitor data-source configuration changed; move or "
-            "delete the old state file before restarting"
-        )
-    if root.get("baselineSha256") != baseline_sha256_value:
-        raise ValueError(
-            "Prometheus baseline changed; move or delete the old state file "
-            "before restarting"
-        )
-    raw_buffer = _mapping(root.get("inferenceBuffer", {}), "inferenceBuffer")
-    buffer: dict[str, TimeSeries] = {}
-    for metric in metrics:
-        series_raw = _mapping(raw_buffer.get(metric, {}), f"buffer.{metric}")
-        timestamps = series_raw.get("timestamps", [])
-        values = series_raw.get("values", [])
-        if not isinstance(timestamps, list) or not isinstance(values, list):
-            raise TypeError(f"buffer for {metric!r} must contain arrays")
-        series = TimeSeries(
-            timestamps=[float(item) for item in timestamps],
-            values=[float(item) for item in values],
-        )
-        if len(series.timestamps) != len(series.values):
-            raise ValueError(f"buffer for {metric!r} has mismatched arrays")
-        buffer[metric] = series
-    last_timestamp_raw = root.get("lastTimestamp")
-    last_timestamp = None if last_timestamp_raw is None else float(last_timestamp_raw)
-    if last_timestamp is not None and not math.isfinite(last_timestamp):
-        raise ValueError("state lastTimestamp must be finite")
-    last_step_raw = root.get("lastGlobalStep")
-    if last_step_raw is not None and (
-        isinstance(last_step_raw, bool) or not isinstance(last_step_raw, int)
-    ):
-        raise ValueError("state lastGlobalStep must be an integer")
-    round_id = root.get("roundId", 0)
-    if isinstance(round_id, bool) or not isinstance(round_id, int) or round_id < 0:
-        raise ValueError("state roundId must be a non-negative integer")
-    active_raw = _mapping(root.get("activeEventIds", {}), "activeEventIds")
-    active = {
-        _required_text(metric, "active event metric"): _required_text(
-            event_id,
-            f"activeEventIds.{metric}",
-        )
-        for metric, event_id in active_raw.items()
-    }
-    return PrometheusMonitorState(
-        last_timestamp=last_timestamp,
-        last_global_step=last_step_raw,
-        inference_buffer=_trim_buffer(buffer, window_points),
-        round_id=round_id,
-        active_event_ids=active,
-    )
+        raise ValueError(f"could not load {name} {path}: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise ValueError(f"{name} root must be an object")
+    return raw
 
 
-def _event_id(
-    task_id: str,
-    target: str,
-    baseline_id: str,
-    abnormal_range: Mapping[str, Any],
-) -> str:
-    payload = {
-        "taskId": task_id,
-        "target": target,
-        "baselineId": baseline_id,
-        "startTime": abnormal_range.get("startTime"),
-        "abnormalType": abnormal_range.get("abnormalType"),
-    }
-    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+def _trim(series: TimeSeries, points: int) -> TimeSeries:
+    if len(series) <= points:
+        return series
+    return TimeSeries(series.timestamps[-points:], series.values[-points:])
 
 
-def _top_associations(result: Mapping[str, Any], target: str) -> list[Any]:
-    analysis = result.get("associationAnalysis")
-    if not isinstance(analysis, Mapping):
-        return []
-    targets = analysis.get("targets")
-    if not isinstance(targets, Mapping):
-        return []
-    target_result = targets.get(target)
-    if not isinstance(target_result, Mapping):
-        return []
-    events = target_result.get("events")
-    if not isinstance(events, list) or not events:
-        return []
-    latest = events[-1]
-    if not isinstance(latest, Mapping):
-        return []
-    associations = latest.get("topAssociations")
-    return copy.deepcopy(associations) if isinstance(associations, list) else []
-
-
-def _state_change_events(
-    result: Mapping[str, Any],
-    *,
-    targets: Sequence[str],
-    task_id: str,
-    baseline_id: str,
-    previous_active: Mapping[str, str],
-    detected_at: str,
-) -> tuple[list[dict[str, Any]], dict[str, str]]:
-    active = dict(previous_active)
-    events: list[dict[str, Any]] = []
-    ranges_by_metric = result.get("abnormalTimeRange", {})
-    if not isinstance(ranges_by_metric, Mapping):
-        ranges_by_metric = {}
-    metric_errors = result.get("metricErrors", {})
-    if not isinstance(metric_errors, Mapping):
-        metric_errors = {}
-    metric_results = result.get("results", {})
-    if not isinstance(metric_results, Mapping):
-        metric_results = {}
-    for target in targets:
-        # A failed target evaluation is not evidence of recovery. Likewise, a
-        # current range waiting for history confirmation keeps an active event
-        # open until the detector observes a genuinely normal window.
-        if target in metric_errors or target not in ranges_by_metric:
-            continue
-        raw_ranges = ranges_by_metric.get(target, [])
-        ranges = raw_ranges if isinstance(raw_ranges, list) else []
-        target_result = metric_results.get(target, {})
-        current_ranges = (
-            target_result.get("currentAbnormalTimeRange", [])
-            if isinstance(target_result, Mapping)
-            else []
-        )
-        has_current_range = isinstance(current_ranges, list) and bool(current_ranges)
-        if ranges and target not in active:
-            latest_range = ranges[-1]
-            if not isinstance(latest_range, Mapping):
-                continue
-            event_id = _event_id(task_id, target, baseline_id, latest_range)
-            active[target] = event_id
-            events.append(
-                {
-                    "eventId": event_id,
-                    "eventType": "ABNORMAL",
-                    "detectedAt": detected_at,
-                    "targetMetric": target,
-                    "abnormalRange": copy.deepcopy(dict(latest_range)),
-                    "topAssociations": _top_associations(result, target),
-                }
-            )
-        elif not ranges and not has_current_range and target in active:
-            active_id = active.pop(target)
-            recovery_raw = f"{active_id}:RECOVERED"
-            recovery_id = hashlib.sha256(recovery_raw.encode("utf-8")).hexdigest()[:24]
-            events.append(
-                {
-                    "eventId": recovery_id,
-                    "eventType": "RECOVERED",
-                    "detectedAt": detected_at,
-                    "targetMetric": target,
-                    "activeEventId": active_id,
-                    "topAssociations": [],
-                }
-            )
-    return events, active
-
-
-class PrometheusMonitor:
-    """Stateful three-minute poller using existing fit and detect APIs."""
+class PrometheusRuntime:
+    """One direct path from Prometheus JSON to the existing algorithm."""
 
     def __init__(
         self,
-        config: PrometheusMonitorConfig,
+        config: MonitorConfig,
         *,
         client: Any | None = None,
-        baseline: BaselineModelFile | None = None,
-        runner: DetectionRunner | None = None,
-        now: Callable[[], datetime] | None = None,
+        now: Callable[[], datetime] = _utc_now,
     ) -> None:
         self.config = config
-        self.policy = load_algorithm_policy_config(config.policy_config)
-        self.policies = _metric_policies(self.policy, config.queries)
         self.client = client or PrometheusHttpClient(
-            config.prometheus.url,
-            timeout_seconds=config.prometheus.timeout_seconds,
-            verify_tls=config.prometheus.verify_tls,
-            bearer_token_env=config.prometheus.bearer_token_env,
-            username_env=config.prometheus.username_env,
-            password_env=config.prometheus.password_env,
+            config.prometheus_url,
+            timeout_seconds=config.timeout_seconds,
+            verify_tls=config.verify_tls,
         )
-        self._now = now or (lambda: datetime.now(timezone.utc))
-        self.source_fingerprint = _source_fingerprint(config)
-        self.baseline: BaselineModelFile | None = None
-        self.baseline_sha256: str | None = None
-        self.runner: DetectionRunner | None = None
-        self.state: PrometheusMonitorState | None = None
-        self._minimum_samples: dict[str, int] = {}
-        if baseline is not None:
-            self._activate_baseline(baseline, runner=runner)
-        elif config.baseline_model.exists():
-            loaded = load_baseline_model(
-                config.baseline_model,
-                expected_metrics=config.metrics,
-            )
-            self._activate_baseline(loaded, runner=runner)
-        elif not config.baseline.auto_fit:
-            raise ValueError(f"baseline model does not exist: {config.baseline_model}")
-        elif runner is not None:
-            raise ValueError("runner cannot be supplied without a baseline")
+        self.now = now
 
-    def _activate_baseline(
-        self,
-        baseline: BaselineModelFile,
-        *,
-        runner: DetectionRunner | None = None,
-    ) -> None:
-        self.baseline = baseline
-        self.baseline_sha256 = baseline_model_sha256(baseline)
-        self.runner = runner or BaselineDetectionRunner(
-            baseline,
-            metrics=self.config.metrics,
-            task_id=self.config.task_id,
-            association_targets=self.config.target_metrics,
-            metric_policies=self.policies,
-            history_policy=self.policy.history_policy,
-        )
-        requirements = self.runner.minimum_inference_samples()
-        for target in self.config.target_metrics:
-            minimum = requirements.get(target)
-            if (
-                isinstance(minimum, bool)
-                or not isinstance(minimum, int)
-                or minimum <= 0
-            ):
-                raise ValueError(
-                    f"invalid minimum inference sample count for {target!r}"
-                )
-            if minimum > self.config.inference_window_points:
-                raise ValueError(
-                    "inference_window_points is smaller than the required "
-                    f"{minimum} points for target {target!r}"
-                )
-        self._minimum_samples = requirements
-        assert self.baseline_sha256 is not None
-        self.state = _load_state(
-            self.config.state_file,
-            metrics=self.config.metrics,
-            source_fingerprint=self.source_fingerprint,
-            baseline_sha256_value=self.baseline_sha256,
-            window_points=self.config.inference_window_points,
-        )
+    def _range(self) -> tuple[float, float]:
+        end = self.now().astimezone(timezone.utc).timestamp()
+        return end - self.config.lookback_seconds, end
 
-    def _query_window(
+    def _snapshot(
         self,
-        start: float,
-        end: float,
-    ) -> tuple[TimeSeries, dict[str, TimeSeries]]:
-        prom = self.config.prometheus
-        global_steps = self.client.query_range(
-            prom.global_step_query,
+    ) -> tuple[
+        list[SeriesSpec],
+        dict[str, TimeSeries],
+        list[dict[str, str]],
+        float,
+        float,
+    ]:
+        start, end = self._range()
+        discovered = self.client.list_series(
+            self.config.series_selector,
             start=start,
             end=end,
-            step=prom.query_step_seconds,
         )
-        metrics = self.client.fetch_range(
-            self.config.queries,
-            start=start,
-            end=end,
-            step=prom.query_step_seconds,
-        )
-        return global_steps, metrics
-
-    def _bootstrap(self, now_timestamp: float) -> None:
-        prom = self.config.prometheus
-        start = now_timestamp - prom.lookback_seconds
-        global_steps, metrics = self._query_window(start, now_timestamp)
-        window = build_bootstrap_window(
-            global_steps,
-            metrics,
-            start_step=self.config.baseline.start_step,
-            end_step=self.config.baseline.end_step,
-            alignment_tolerance_seconds=prom.alignment_tolerance_seconds,
-        )
-        expected_steps = (
-            self.config.baseline.end_step - self.config.baseline.start_step + 1
-        )
-        coverage = len(window.observed_steps) / expected_steps
-        if coverage < self.config.baseline.minimum_step_coverage_ratio:
-            raise ValueError(
-                "baseline global-step coverage is too low: "
-                f"{coverage:.3f} < "
-                f"{self.config.baseline.minimum_step_coverage_ratio:.3f}"
-            )
-        for metric in self.config.metrics:
-            count = len(window.series.get(metric, TimeSeries()))
-            if count < self.config.baseline.minimum_samples_per_metric:
-                raise ValueError(
-                    f"baseline has only {count} aligned samples for {metric!r}; "
-                    "increase Prometheus history/coverage or lower the configured "
-                    "minimum deliberately"
-                )
-        baseline_id = self.config.baseline.baseline_id or (
-            f"{_safe_task_name(self.config.task_id)}-{self.source_fingerprint[:12]}"
-        )
-        model = fit_baseline_model(
-            window.series,
-            self.config.metrics,
-            baseline_id=baseline_id,
-            source_type="prometheus",
-            metric_policies=self.policies,
-            history_policy=self.policy.history_policy,
-        )
-        save_baseline_model(model, self.config.baseline_model)
-        self._activate_baseline(model)
-        assert self.state is not None
-        self.state.last_timestamp = window.end_timestamp
-
-    def _commit_state(self, state: PrometheusMonitorState) -> None:
-        assert self.baseline_sha256 is not None
-        _write_json_atomically(
-            self.config.state_file,
-            _state_payload(
-                state,
-                metrics=self.config.metrics,
-                source_fingerprint=self.source_fingerprint,
-                baseline_sha256=self.baseline_sha256,
-            ),
-        )
-
-    def poll_once(self) -> PrometheusPollOutcome:
-        now = self._now().astimezone(timezone.utc)
-        now_timestamp = now.timestamp()
-        try:
-            if self.baseline is None:
-                self._bootstrap(now_timestamp)
-            assert self.baseline is not None
-            assert self.runner is not None
-            assert self.state is not None
-            prom = self.config.prometheus
-            start = (
-                now_timestamp - prom.lookback_seconds
-                if self.state.last_timestamp is None
-                else self.state.last_timestamp - prom.overlap_seconds
-            )
-            global_steps, raw_metrics = self._query_window(start, now_timestamp)
-            latest_step = latest_integer_step(global_steps)
-            if latest_step is None:
-                return PrometheusPollOutcome(
-                    status="waiting_for_global_step",
-                )
-            if (
-                self.state.last_global_step is not None
-                and latest_step < self.state.last_global_step
-            ):
-                raise ValueError(
-                    "training global step moved backwards; use a new task_id/state "
-                    "file for the restarted run"
-                )
-            if (
-                self.state.last_global_step is not None
-                and latest_step == self.state.last_global_step
-            ):
-                candidate = PrometheusMonitorState(
-                    last_timestamp=now_timestamp,
-                    last_global_step=latest_step,
-                    inference_buffer=_copy_buffer(self.state.inference_buffer),
-                    round_id=self.state.round_id,
-                    active_event_ids=dict(self.state.active_event_ids),
-                )
-                self._commit_state(candidate)
-                self.state = candidate
-                return PrometheusPollOutcome(status="no_new_data")
-            new_metrics = filter_after_global_step(
-                global_steps,
-                raw_metrics,
-                minimum_step_exclusive=self.config.baseline.end_step,
-                alignment_tolerance_seconds=prom.alignment_tolerance_seconds,
-            )
-            merged = {
-                metric: _merge_series(
-                    self.state.inference_buffer.get(metric, TimeSeries()),
-                    new_metrics.get(metric, TimeSeries()),
-                )
-                for metric in self.config.metrics
-            }
-            buffer = _trim_buffer(merged, self.config.inference_window_points)
-            candidate = PrometheusMonitorState(
-                last_timestamp=now_timestamp,
-                last_global_step=latest_step,
-                inference_buffer=buffer,
-                round_id=self.state.round_id,
-                active_event_ids=dict(self.state.active_event_ids),
-            )
-            has_points = any(len(series) for series in new_metrics.values())
-            enough = all(
-                len(buffer.get(target, TimeSeries())) >= self._minimum_samples[target]
-                for target in self.config.target_metrics
-            )
-            if not has_points or not enough:
-                self._commit_state(candidate)
-                self.state = candidate
-                return PrometheusPollOutcome(
-                    status="waiting_for_data" if has_points else "no_new_data"
-                )
-
-            runtime_snapshot = self.runner.snapshot_runtime_state()
+        specs = [SeriesSpec(series, _role(series, self.config)) for series in discovered]
+        values: dict[str, TimeSeries] = {}
+        failures: list[dict[str, str]] = []
+        for spec in specs:
             try:
-                result = self.runner.run(_copy_buffer(buffer))
-                detected_at = now.isoformat()
-                events, active = _state_change_events(
-                    result,
-                    targets=self.config.target_metrics,
-                    task_id=self.config.task_id,
-                    baseline_id=self.baseline.baseline_id,
-                    previous_active=self.state.active_event_ids,
-                    detected_at=detected_at,
+                values[spec.identifier] = self.client.query_range(
+                    spec.series.selector,
+                    start=start,
+                    end=end,
+                    step=self.config.query_step_seconds,
                 )
-                candidate.round_id = self.state.round_id + 1
-                candidate.active_event_ids = active
-                result["events"] = events
-                result["metadata"] = {
-                    "schemaVersion": 1,
-                    "mode": "prometheus-polling",
-                    "sourceType": "prometheus",
-                    "roundId": candidate.round_id,
-                    "detectedAt": detected_at,
-                    "baselineId": self.baseline.baseline_id,
-                    "baselineSha256": self.baseline_sha256,
-                    "sourceFingerprint": self.source_fingerprint,
-                    "queryRange": {"start": start, "end": now_timestamp},
-                    "queryStepSeconds": prom.query_step_seconds,
-                    "pollIntervalSeconds": self.config.poll_interval_seconds,
-                    "lastGlobalStep": latest_step,
-                    "selectedMetrics": list(self.config.metrics),
-                    "targetMetrics": list(self.config.target_metrics),
-                    "candidateMetrics": list(self.config.candidate_metrics),
-                    "perMetricPointCounts": {
-                        metric: len(buffer.get(metric, TimeSeries()))
-                        for metric in self.config.metrics
+            except Exception as exc:  # One bad series must not hide all others.
+                failures.append(
+                    {
+                        "id": spec.identifier,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+                values[spec.identifier] = TimeSeries()
+        return specs, values, failures, start, end
+
+    @staticmethod
+    def _select_global_step(
+        specs: Sequence[SeriesSpec], values: Mapping[str, TimeSeries]
+    ) -> SeriesSpec:
+        candidates: list[tuple[int, int, str, SeriesSpec]] = []
+        for spec in specs:
+            if spec.role != "global_step":
+                continue
+            series = values.get(spec.identifier, TimeSeries())
+            latest = latest_integer_step(series)
+            if latest is not None:
+                candidates.append((latest, len(series), spec.identifier, spec))
+        if not candidates:
+            raise ValueError(
+                "no readable global-step series was found; adjust global_step_patterns"
+            )
+        return max(candidates, key=lambda item: (item[0], item[1], item[2]))[3]
+
+    def query(self) -> dict[str, Any]:
+        specs, values, failures, start, end = self._snapshot()
+        payload = {
+            "schemaVersion": 1,
+            "queriedAt": self.now().astimezone(timezone.utc).isoformat(),
+            "prometheusUrl": self.config.prometheus_url,
+            "queryRange": {"start": start, "end": end},
+            "series": [
+                {
+                    **spec.to_dict(),
+                    "samples": {
+                        "timestamps": values[spec.identifier].timestamps,
+                        "values": values[spec.identifier].values,
                     },
                 }
-                latest_path = _write_json_atomically(
-                    self.config.output_dir
-                    / f"{_safe_task_name(self.config.task_id)}_latest.json",
-                    result,
-                )
-                event_path: Path | None = None
-                if events:
-                    event_key = hashlib.sha256(
-                        ":".join(event["eventId"] for event in events).encode("utf-8")
-                    ).hexdigest()[:24]
-                    event_path = _write_json_atomically(
-                        self.config.output_dir / f"event_{event_key}.json",
-                        result,
-                    )
-                self._commit_state(candidate)
-            except KeyboardInterrupt:
-                self.runner.restore_runtime_state(runtime_snapshot)
-                raise
-            except Exception:
-                self.runner.restore_runtime_state(runtime_snapshot)
-                raise
-            self.state = candidate
-            return PrometheusPollOutcome(
-                status="state_changed" if events else "detected",
-                result=result,
-                output_path=latest_path,
-                event_path=event_path,
+                for spec in specs
+            ],
+            "failures": failures,
+            "summary": {
+                "series": len(specs),
+                "globalSteps": sum(spec.role == "global_step" for spec in specs),
+                "targets": sum(spec.role == "target" for spec in specs),
+                "candidates": sum(spec.role == "candidate" for spec in specs),
+                "failedQueries": len(failures),
+            },
+        }
+        _write_json(self.config.query_file, payload)
+        return payload
+
+    def train(self) -> dict[str, Any]:
+        specs, values, failures, start, end = self._snapshot()
+        global_spec = self._select_global_step(specs, values)
+        algorithm_specs = [
+            spec for spec in specs if spec.role in {"target", "candidate"}
+        ]
+        window = build_bootstrap_window(
+            values[global_spec.identifier],
+            {spec.identifier: values[spec.identifier] for spec in algorithm_specs},
+            start_step=self.config.baseline_start_step,
+            end_step=self.config.baseline_end_step,
+            alignment_tolerance_seconds=self.config.alignment_tolerance_seconds,
+        )
+        policy = load_algorithm_policy_config(self.config.algorithm_config)
+        policies = _metric_policies(policy, algorithm_specs, top_k=self.config.top_k)
+        fitted: dict[str, MetricBaseline] = {}
+        retained: list[SeriesSpec] = []
+        skipped: list[dict[str, Any]] = []
+        created_at = self.now().astimezone(timezone.utc).isoformat()
+
+        for spec in algorithm_specs:
+            series = window.series.get(spec.identifier, TimeSeries())
+            required = max(
+                self.config.minimum_baseline_samples,
+                int(
+                    resolve_metric_policy(
+                        spec.identifier, policies[spec.identifier]
+                    )["minimum_standard_points"]
+                ),
             )
-        except KeyboardInterrupt:
-            raise
-        except Exception as exc:  # noqa: BLE001 - one bad poll must not stop service.
-            return PrometheusPollOutcome(
-                status="error",
-                error={"type": type(exc).__name__, "message": str(exc)},
+            if len(series) < required:
+                skipped.append(
+                    {
+                        **spec.to_dict(),
+                        "reason": "insufficient_baseline_samples",
+                        "samples": len(series),
+                        "required": required,
+                    }
+                )
+                continue
+            try:
+                single = fit_baseline_model(
+                    {spec.identifier: series},
+                    [spec.identifier],
+                    baseline_id="prometheus",
+                    source_type="prometheus",
+                    metric_policies={spec.identifier: policies[spec.identifier]},
+                    history_policy=policy.history_policy,
+                    created_at=created_at,
+                )
+            except Exception as exc:
+                skipped.append(
+                    {
+                        **spec.to_dict(),
+                        "reason": "baseline_fit_failed",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+                continue
+            fitted[spec.identifier] = single.metrics[spec.identifier]
+            retained.append(spec)
+
+        targets = [spec for spec in retained if spec.role == "target"]
+        if not targets:
+            raise ValueError(
+                "no time/timing target could be trained; inspect skippedSeries"
+            )
+        baseline = baseline_model_from_dict(
+            BaselineModelFile(
+                baseline_id="prometheus",
+                created_at=created_at,
+                source_type="prometheus",
+                metrics=fitted,
+                history_policy=policy.history_policy,
+            ).to_dict()
+        )
+        payload = {
+            "schemaVersion": TRAINING_SCHEMA_VERSION,
+            "createdAt": created_at,
+            "prometheusUrl": self.config.prometheus_url,
+            "seriesSelector": self.config.series_selector,
+            "queryRange": {"start": start, "end": end},
+            "trainingInterval": {
+                "startStep": self.config.baseline_start_step,
+                "endStep": self.config.baseline_end_step,
+                "observedSteps": list(window.observed_steps),
+                "sourceStartTime": window.start_timestamp,
+                "sourceEndTime": window.end_timestamp,
+            },
+            "globalStepSeries": global_spec.to_dict(),
+            "series": [spec.to_dict() for spec in retained],
+            "skippedSeries": skipped,
+            "queryFailures": failures,
+            "model": baseline.to_dict(),
+            "summary": {
+                "discovered": len(specs),
+                "trained": len(retained),
+                "targets": len(targets),
+                "candidates": sum(spec.role == "candidate" for spec in retained),
+                "skipped": len(skipped),
+            },
+        }
+        _write_json(self.config.training_file, payload)
+        return payload
+
+    def _load_training(
+        self,
+    ) -> tuple[dict[str, Any], BaselineModelFile, SeriesSpec, list[SeriesSpec]]:
+        artifact = _read_json(self.config.training_file, "training artifact")
+        if artifact.get("schemaVersion") != TRAINING_SCHEMA_VERSION:
+            raise ValueError("unsupported training artifact schemaVersion")
+        baseline = baseline_model_from_dict(artifact.get("model"))
+        global_spec = SeriesSpec.from_dict(artifact.get("globalStepSeries"))
+        raw_specs = artifact.get("series")
+        if not isinstance(raw_specs, list) or not raw_specs:
+            raise ValueError("training artifact series must be a non-empty array")
+        specs = [SeriesSpec.from_dict(item) for item in raw_specs]
+        return artifact, baseline, global_spec, specs
+
+    def detect(self) -> dict[str, Any]:
+        artifact, baseline, global_spec, specs = self._load_training()
+        start, end = self._range()
+        failures: list[dict[str, str]] = []
+
+        try:
+            global_steps = self.client.query_range(
+                global_spec.series.selector,
+                start=start,
+                end=end,
+                step=self.config.query_step_seconds,
+            )
+        except Exception as exc:
+            raise ValueError(f"could not query global step: {exc}") from exc
+
+        raw_values: dict[str, TimeSeries] = {}
+        for spec in specs:
+            try:
+                raw_values[spec.identifier] = self.client.query_range(
+                    spec.series.selector,
+                    start=start,
+                    end=end,
+                    step=self.config.query_step_seconds,
+                )
+            except Exception as exc:
+                raw_values[spec.identifier] = TimeSeries()
+                failures.append(
+                    {
+                        "id": spec.identifier,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+
+        interval = artifact.get("trainingInterval", {})
+        if not isinstance(interval, Mapping):
+            raise ValueError("trainingInterval must be an object")
+        baseline_end_step = interval.get("endStep")
+        if isinstance(baseline_end_step, bool) or not isinstance(
+            baseline_end_step, int
+        ):
+            raise ValueError("trainingInterval.endStep must be an integer")
+        inference = filter_after_global_step(
+            global_steps,
+            raw_values,
+            minimum_step_exclusive=baseline_end_step,
+            alignment_tolerance_seconds=self.config.alignment_tolerance_seconds,
+        )
+        inference = {
+            metric: _trim(series, self.config.inference_points)
+            for metric, series in inference.items()
+        }
+
+        targets = [spec.identifier for spec in specs if spec.role == "target"]
+        policy = load_algorithm_policy_config(self.config.algorithm_config)
+        policies = _metric_policies(policy, specs, top_k=self.config.top_k)
+        runner = BaselineDetectionRunner(
+            baseline,
+            metrics=[spec.identifier for spec in specs],
+            task_id="prometheus",
+            association_targets=targets,
+            metric_policies=policies,
+            history_policy=policy.history_policy,
+        )
+        result = runner.run(inference)
+        payload = self._compact_result(
+            result,
+            specs,
+            latest_step=latest_integer_step(global_steps),
+            failures=failures,
+            point_counts={metric: len(series) for metric, series in inference.items()},
+        )
+        _write_json(self.config.result_file, payload)
+        return payload
+
+    def _compact_result(
+        self,
+        result: Mapping[str, Any],
+        specs: Sequence[SeriesSpec],
+        *,
+        latest_step: int | None,
+        failures: list[dict[str, str]],
+        point_counts: Mapping[str, int],
+    ) -> dict[str, Any]:
+        metadata = {spec.identifier: spec for spec in specs}
+        ranges = result.get("abnormalTimeRange", {})
+        if not isinstance(ranges, Mapping):
+            ranges = {}
+        states = result.get("states", {})
+        if not isinstance(states, Mapping):
+            states = {}
+        analysis = result.get("associationAnalysis", {})
+        analysis_targets = analysis.get("targets", {}) if isinstance(analysis, Mapping) else {}
+        if not isinstance(analysis_targets, Mapping):
+            analysis_targets = {}
+
+        target_results: list[dict[str, Any]] = []
+        anomalies: list[dict[str, Any]] = []
+        for spec in specs:
+            raw_intervals = ranges.get(spec.identifier, [])
+            intervals = raw_intervals if isinstance(raw_intervals, list) else []
+            if intervals:
+                anomalies.append(
+                    {
+                        **spec.to_dict(),
+                        "intervals": intervals,
+                    }
+                )
+            if spec.role != "target":
+                continue
+            target_analysis = analysis_targets.get(spec.identifier, {})
+            events = (
+                target_analysis.get("events", [])
+                if isinstance(target_analysis, Mapping)
+                else []
+            )
+            compact_events: list[dict[str, Any]] = []
+            if isinstance(events, list):
+                for event in events:
+                    if not isinstance(event, Mapping):
+                        continue
+                    top = event.get("topAssociations", [])
+                    top5: list[dict[str, Any]] = []
+                    if isinstance(top, list):
+                        for item in top[: self.config.top_k]:
+                            if not isinstance(item, Mapping):
+                                continue
+                            candidate_id = str(item.get("metric", ""))
+                            candidate = metadata.get(candidate_id)
+                            top5.append(
+                                {
+                                    "rank": item.get("rank"),
+                                    "series": candidate_id,
+                                    "metricName": (
+                                        candidate.series.metric_name
+                                        if candidate is not None
+                                        else candidate_id
+                                    ),
+                                    "labels": (
+                                        dict(candidate.series.labels)
+                                        if candidate is not None
+                                        else {}
+                                    ),
+                                    "abnormalContributionPercent": item.get(
+                                        "abnormalContribution", 0.0
+                                    ),
+                                }
+                            )
+                    compact_events.append(
+                        {
+                            "interval": event.get("targetAbnormalRange"),
+                            "top5": top5,
+                        }
+                    )
+            state = states.get(spec.identifier)
+            target_results.append(
+                {
+                    **spec.to_dict(),
+                    "status": (
+                        "abnormal"
+                        if intervals
+                        else "normal"
+                        if state == 0
+                        else "insufficient_data"
+                    ),
+                    "state": state,
+                    "samples": point_counts.get(spec.identifier, 0),
+                    "intervals": intervals,
+                    "events": compact_events,
+                    "top5": compact_events[-1]["top5"] if compact_events else [],
+                }
             )
 
-    def run_forever(
-        self,
-        *,
-        max_polls: int | None = None,
-        sleep: Callable[[float], None] = time.sleep,
-    ) -> None:
-        polls = 0
-        while max_polls is None or polls < max_polls:
-            outcome = self.poll_once()
-            polls += 1
-            if outcome.status == "error":
-                assert outcome.error is not None
-                sys.stderr.write(
-                    f"poll error: {outcome.error['type']}: {outcome.error['message']}\n"
+        metric_errors = result.get("metricErrors", {})
+        overall_status = (
+            "abnormal"
+            if anomalies
+            else "normal"
+            if any(target["status"] == "normal" for target in target_results)
+            else "insufficient_data"
+        )
+        payload = {
+            "schemaVersion": RESULT_SCHEMA_VERSION,
+            "detectedAt": self.now().astimezone(timezone.utc).isoformat(),
+            "status": overall_status,
+            "lastGlobalStep": latest_step,
+            "targets": target_results,
+            "anomalousMetrics": anomalies,
+            "queryFailures": failures,
+            "metricErrors": metric_errors if isinstance(metric_errors, Mapping) else {},
+            "summary": {
+                "targets": len(target_results),
+                "abnormalTargets": sum(
+                    target["status"] == "abnormal" for target in target_results
+                ),
+                "anomalousMetrics": len(anomalies),
+                "queryFailures": len(failures),
+            },
+        }
+        return to_json_serializable(payload)
+
+    def start(self, *, sleep: Callable[[float], None] = time.sleep) -> None:
+        """Poll forever; association is already included in every detection."""
+
+        while True:
+            try:
+                result = self.detect()
+                print(
+                    json.dumps(
+                        {
+                            "status": result["status"],
+                            "lastGlobalStep": result["lastGlobalStep"],
+                            "result": str(self.config.result_file),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
                 )
-            elif outcome.event_path is not None:
-                sys.stdout.write(f"event JSON: {outcome.event_path}\n")
-            elif outcome.output_path is not None:
-                sys.stdout.write(f"latest result: {outcome.output_path}\n")
-            if max_polls is None or polls < max_polls:
-                sleep(self.config.poll_interval_seconds)
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:  # A later poll can recover from transient errors.
+                print(f"poll error: {type(exc).__name__}: {exc}", file=sys.stderr)
+            sleep(self.config.poll_interval_seconds)
+
+
+def _normalized(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.casefold())
+
+
+def _name_tokens(value: str) -> list[str]:
+    return [token for token in re.split(r"[^a-z0-9]+", value.casefold()) if token]
+
+
+def _token_subsequence(needle: str, candidate: str) -> bool:
+    """Allow ``time_step`` to find names such as ``timing_s_step``."""
+
+    wanted = _name_tokens(needle)
+    available = _name_tokens(candidate)
+    if not wanted:
+        return False
+    position = 0
+    for token in wanted:
+        stem = token[:3]
+        while position < len(available) and not available[position].startswith(stem):
+            position += 1
+        if position == len(available):
+            return False
+        position += 1
+    return True
+
+
+def select_analysis(result: Mapping[str, Any], target: str | None) -> dict[str, Any]:
+    """Return one target's latest Top-5 view, or all targets when omitted."""
+
+    raw_targets = result.get("targets", [])
+    if not isinstance(raw_targets, list):
+        raise ValueError("anomaly result targets must be an array")
+    targets = [item for item in raw_targets if isinstance(item, Mapping)]
+    selected = targets
+    if target is not None:
+        needle = _normalized(_text(target, "target"))
+        exact = [
+            item
+            for item in targets
+            if needle
+            in {
+                _normalized(str(item.get("id", ""))),
+                _normalized(str(item.get("metricName", ""))),
+            }
+        ]
+        selected = exact or [
+            item
+            for item in targets
+            if needle in _normalized(str(item.get("id", "")))
+            or needle in _normalized(str(item.get("metricName", "")))
+            or _token_subsequence(target, str(item.get("metricName", "")))
+        ]
+        if not selected:
+            available = ", ".join(str(item.get("metricName")) for item in targets)
+            raise ValueError(f"target {target!r} was not found; available: {available}")
+        if len(selected) > 1:
+            names = ", ".join(str(item.get("id")) for item in selected[:10])
+            raise ValueError(f"target {target!r} matches multiple series: {names}")
+
+    views = [
+        {
+            "target": item.get("id"),
+            "metricName": item.get("metricName"),
+            "labels": item.get("labels", {}),
+            "status": item.get("status"),
+            "intervals": item.get("intervals", []),
+            "top5": item.get("top5", []),
+        }
+        for item in selected
+    ]
+    return {"targets": views}
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Poll Prometheus for RL-Insight degradation detection",
+        prog="python -m experiment.degradation_perception",
+        description="Prometheus degradation experiment",
     )
-    parser.add_argument("--config", required=True, type=Path)
-    parser.add_argument(
-        "--once",
-        action="store_true",
-        help="perform one bootstrap/poll cycle and exit",
-    )
+    commands = parser.add_subparsers(dest="command", required=True)
+    for name, help_text in (
+        ("start", "poll forever"),
+        ("train", "fit step-range baseline and write training.json"),
+        ("query", "download all discovered series to query.json"),
+        ("detect", "run one detection and write anomalies.json"),
+        ("analyze", "show a target's latest Top-5 associations"),
+    ):
+        command = commands.add_parser(name, help=help_text)
+        command.add_argument(
+            "--config",
+            type=Path,
+            default=Path(__file__).with_name("config.yaml"),
+        )
+        if name == "analyze":
+            command.add_argument("--target", help="metric name or unique substring")
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(list(argv) if argv is not None else None)
-    try:
-        monitor = PrometheusMonitor(load_prometheus_monitor_config(args.config))
-        if args.once:
-            outcome = monitor.poll_once()
-            if outcome.status == "error":
-                assert outcome.error is not None
-                raise ValueError(f"{outcome.error['type']}: {outcome.error['message']}")
-            sys.stdout.write(f"status: {outcome.status}\n")
-            if outcome.output_path is not None:
-                sys.stdout.write(f"latest result: {outcome.output_path}\n")
-            if outcome.event_path is not None:
-                sys.stdout.write(f"event JSON: {outcome.event_path}\n")
+    parser = build_parser()
+    args, unknown = parser.parse_known_args(list(argv) if argv is not None else None)
+    if unknown:
+        if (
+            args.command == "analyze"
+            and args.target is None
+            and len(unknown) == 1
+            and unknown[0].startswith("--")
+            and len(unknown[0]) > 2
+        ):
+            args.target = unknown[0][2:]
         else:
-            monitor.run_forever()
+            parser.error("unrecognized arguments: " + " ".join(unknown))
+    try:
+        config = load_config(args.config)
+        runtime = PrometheusRuntime(config)
+        if args.command == "query":
+            payload = runtime.query()
+            print(json.dumps(payload["summary"], ensure_ascii=False, indent=2))
+            print(f"saved: {config.query_file}")
+        elif args.command == "train":
+            payload = runtime.train()
+            print(json.dumps(payload["summary"], ensure_ascii=False, indent=2))
+            print(f"saved: {config.training_file}")
+        elif args.command == "detect":
+            payload = runtime.detect()
+            print(json.dumps(payload["summary"], ensure_ascii=False, indent=2))
+            print(f"saved: {config.result_file}")
+        elif args.command == "analyze":
+            payload = _read_json(config.result_file, "anomaly result")
+            print(
+                json.dumps(
+                    select_analysis(payload, args.target),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    indent=2,
+                )
+            )
+        else:
+            runtime.start()
         return 0
     except KeyboardInterrupt:
         return 130
     except (OSError, TypeError, ValueError) as exc:
-        sys.stderr.write(f"error: {exc}\n")
+        print(f"error: {exc}", file=sys.stderr)
         return 1
 
 
@@ -1207,14 +926,11 @@ if __name__ == "__main__":
 
 
 __all__ = [
-    "BaselineBootstrapConfig",
-    "PrometheusConnectionConfig",
-    "PrometheusMonitor",
-    "PrometheusMonitorConfig",
-    "PrometheusMonitorState",
-    "PrometheusPollOutcome",
-    "TargetSelectionConfig",
+    "MonitorConfig",
+    "PrometheusRuntime",
+    "SeriesSpec",
     "build_parser",
-    "load_prometheus_monitor_config",
+    "load_config",
     "main",
+    "select_analysis",
 ]

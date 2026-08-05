@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
 from bisect import bisect_left
@@ -38,14 +39,64 @@ class PrometheusDataError(PrometheusSourceError):
     """Prometheus returned data that cannot be mapped unambiguously."""
 
 
-@dataclass(frozen=True)
-class PrometheusMetricQuery:
-    """One internal metric name and the PromQL used to populate it."""
+def _promql_string(value: str) -> str:
+    """Quote one PromQL label value without accepting raw PromQL fragments."""
 
-    name: str
-    promql: str
-    role: str = "auto"
-    abnormal_type: str | None = None
+    return json.dumps(value, ensure_ascii=False)
+
+
+@dataclass(frozen=True)
+class PrometheusSeries:
+    """One concrete Prometheus series returned by ``/api/v1/series``."""
+
+    metric_name: str
+    labels: dict[str, str]
+
+    @classmethod
+    def from_label_set(cls, raw: Mapping[str, Any]) -> "PrometheusSeries":
+        if not isinstance(raw, Mapping):
+            raise PrometheusDataError("Prometheus series entry must be an object")
+        metric_name = raw.get("__name__")
+        if not isinstance(metric_name, str) or not metric_name:
+            raise PrometheusDataError(
+                "Prometheus series entry is missing a non-empty __name__"
+            )
+        labels: dict[str, str] = {}
+        for key, value in raw.items():
+            if not isinstance(key, str) or not isinstance(value, str):
+                raise PrometheusDataError(
+                    "Prometheus series labels must be string pairs"
+                )
+            if key != "__name__":
+                labels[key] = value
+        return cls(metric_name=metric_name, labels=labels)
+
+    @property
+    def selector(self) -> str:
+        matchers = [f'__name__={_promql_string(self.metric_name)}']
+        matchers.extend(
+            f'{key}={_promql_string(value)}'
+            for key, value in sorted(self.labels.items())
+        )
+        return "{" + ",".join(matchers) + "}"
+
+    @property
+    def identifier(self) -> str:
+        if not self.labels:
+            return self.metric_name
+        labels = ",".join(
+            f'{key}={_promql_string(value)}'
+            for key, value in sorted(self.labels.items())
+        )
+        return f"{self.metric_name}{{{labels}}}"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.identifier,
+            "metricName": self.metric_name,
+            "labels": dict(sorted(self.labels.items())),
+            "selector": self.selector,
+        }
 
 
 @dataclass(frozen=True)
@@ -194,6 +245,58 @@ class PrometheusHttpClient:
                 )
             self.auth = (username, password)
 
+    def list_series(
+        self,
+        match: str = '{__name__=~".+"}',
+        *,
+        start: float,
+        end: float,
+    ) -> list[PrometheusSeries]:
+        """Return every concrete label set present in the requested interval."""
+
+        if not isinstance(match, str) or not match.strip():
+            raise ValueError("series match selector must be a non-empty string")
+        start_number = _finite_float(start, "start")
+        end_number = _finite_float(end, "end")
+        if start_number > end_number:
+            raise ValueError("start must not exceed end")
+        try:
+            response = self.session.get(
+                f"{self.base_url}/api/v1/series",
+                params={
+                    "match[]": match.strip(),
+                    "start": start_number,
+                    "end": end_number,
+                },
+                headers=dict(self.headers),
+                auth=self.auth,
+                timeout=self.timeout_seconds,
+                verify=self.verify_tls,
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            raise PrometheusRequestError(
+                f"Prometheus series discovery failed for {match!r}: {exc}"
+            ) from exc
+        if not isinstance(payload, Mapping):
+            raise PrometheusDataError("Prometheus response must be a JSON object")
+        if payload.get("status") != "success":
+            error_type = payload.get("errorType", "api_error")
+            message = payload.get("error", "Prometheus series discovery failed")
+            raise PrometheusRequestError(f"{error_type}: {message}")
+        raw_series = payload.get("data")
+        if not isinstance(raw_series, list):
+            raise PrometheusDataError("Prometheus series data must be an array")
+
+        unique: dict[str, PrometheusSeries] = {}
+        for raw in raw_series:
+            series = PrometheusSeries.from_label_set(raw)
+            unique[series.identifier] = series
+        return [unique[key] for key in sorted(unique)]
+
     def query_range(
         self,
         query: str,
@@ -232,25 +335,6 @@ class PrometheusHttpClient:
                 f"Prometheus query_range failed for {query!r}: {exc}"
             ) from exc
         return _parse_matrix_result(payload, query=query)
-
-    def fetch_range(
-        self,
-        queries: Sequence[PrometheusMetricQuery],
-        *,
-        start: float,
-        end: float,
-        step: float,
-    ) -> dict[str, TimeSeries]:
-        result: dict[str, TimeSeries] = {}
-        for metric in queries:
-            result[metric.name] = self.query_range(
-                metric.promql,
-                start=start,
-                end=end,
-                step=step,
-            )
-        return result
-
 
 def _finite_points(series: TimeSeries) -> list[tuple[float, float]]:
     points: dict[float, float] = {}
@@ -394,7 +478,7 @@ __all__ = [
     "BootstrapWindow",
     "PrometheusDataError",
     "PrometheusHttpClient",
-    "PrometheusMetricQuery",
+    "PrometheusSeries",
     "PrometheusRequestError",
     "PrometheusSourceError",
     "build_bootstrap_window",

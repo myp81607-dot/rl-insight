@@ -1,4 +1,3 @@
-# Supplemental dependency for optional anomaly-association analysis.
+# Dependencies used by the Prometheus experiment CLI.
 scikit-learn>=1.5,<2
-# Shared algorithm and remote-monitor configuration loader.
 PyYAML>=6,<7

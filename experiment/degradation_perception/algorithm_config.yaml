@@ -24,9 +24,9 @@ history_policy:
   n_keep_abnormal: 1
 
 association:
-  enabled: false
-  target_metrics:
-    - timing_s/step
+  # The Prometheus CLI auto-fills every discovered time/timing target.
+  enabled: true
+  target_metrics: []
   weights:
     correlation: 0.5
     random_forest: 0.5

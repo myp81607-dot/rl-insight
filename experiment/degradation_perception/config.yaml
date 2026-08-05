@@ -1,0 +1,26 @@
+# Prometheus can be 127.0.0.1 only when this script and Prometheus share a
+# network namespace. Otherwise change it to http://<prometheus-host>:9090.
+prometheus_url: http://127.0.0.1:9090
+
+# Discover every concrete time series in the lookback interval.
+series_selector: '{__name__=~".+"}'
+query_step_seconds: 10
+lookback_seconds: 86400
+alignment_tolerance_seconds: 6
+
+# Use global steps 5 through 25 as the healthy baseline.
+baseline_steps: [5, 25]
+minimum_baseline_samples: 10
+
+# Detection keeps the latest points after the baseline and polls every 3 minutes.
+inference_points: 120
+poll_interval_seconds: 180
+
+# Metric names containing time/timing are targets. All others are candidates;
+# names containing global_step are used only for step alignment.
+target_patterns: [time, timing]
+global_step_patterns: [global_step]
+top_k: 5
+
+algorithm_config: ./algorithm_config.yaml
+output_dir: ./output

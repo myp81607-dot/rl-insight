@@ -18,327 +18,196 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from experiment.degradation_perception.baseline_model import (
-    fit_baseline_model,
-    load_baseline_model,
-)
+import pytest
+
 from experiment.degradation_perception.perception_config import TimeSeries
 from experiment.degradation_perception.prometheus_monitor import (
-    BaselineBootstrapConfig,
-    PrometheusConnectionConfig,
-    PrometheusMonitor,
-    PrometheusMonitorConfig,
-    TargetSelectionConfig,
-    load_prometheus_monitor_config,
+    MonitorConfig,
+    PrometheusRuntime,
+    load_config,
+    main,
+    select_analysis,
 )
-from experiment.degradation_perception.prometheus_source import (
-    PrometheusMetricQuery,
-)
+from experiment.degradation_perception.prometheus_source import PrometheusSeries
 
-TARGET = "timing_s/step"
-CANDIDATE = "actor/entropy"
+
 FIXED_NOW = datetime(2026, 8, 5, 12, 0, tzinfo=timezone.utc)
 
 
-def _write_policy(path: Path) -> None:
-    path.write_text("{}\n", encoding="utf-8")
-
-
-def test_config_uses_time_timing_defaults_and_explicit_overrides(tmp_path: Path):
-    policy = tmp_path / "algorithm.yaml"
-    _write_policy(policy)
-    config = tmp_path / "prometheus.yaml"
-    config.write_text(
-        "baseline_model: ./baseline.json\n"
-        "policy_config: ./algorithm.yaml\n"
-        "prometheus:\n"
-        "  url: http://prometheus:9090\n"
-        "  global_step_query: training_global_step\n"
-        "metrics:\n"
-        "  timing_s/step:\n"
-        "    promql: timing_metric\n"
-        "  actor/entropy:\n"
-        "    promql: entropy_metric\n"
-        "  custom_metric:\n"
-        "    promql: custom_metric\n"
-        "target_selection:\n"
-        "  patterns: [time, timing]\n"
-        "  overrides:\n"
-        "    custom_metric: target\n",
-        encoding="utf-8",
-    )
-
-    loaded = load_prometheus_monitor_config(config)
-
-    assert loaded.target_metrics == (TARGET, "custom_metric")
-    assert loaded.candidate_metrics == (CANDIDATE,)
-    assert loaded.poll_interval_seconds == 180
-    assert loaded.prometheus.query_step_seconds == 15
-
-
 class FakePrometheusClient:
-    def __init__(self, global_steps: TimeSeries, metrics: dict[str, TimeSeries]):
-        self.global_steps = global_steps
-        self.metrics = metrics
+    def __init__(
+        self,
+        series: list[PrometheusSeries],
+        values: dict[str, TimeSeries],
+    ) -> None:
+        self.series = series
+        self.values = values
+        self.list_calls = []
         self.query_calls = []
-        self.fetch_calls = []
+
+    def list_series(self, match, *, start, end):
+        self.list_calls.append((match, start, end))
+        return list(self.series)
 
     def query_range(self, query, *, start, end, step):
         self.query_calls.append((query, start, end, step))
-        return self.global_steps
-
-    def fetch_range(self, queries, *, start, end, step):
-        self.fetch_calls.append(
-            (tuple(query.name for query in queries), start, end, step)
-        )
-        return {
-            query.name: self.metrics.get(query.name, TimeSeries()) for query in queries
-        }
+        return self.values.get(query, TimeSeries())
 
 
-class FakeRunner:
-    def __init__(self):
-        self.calls = 0
-        self.restore_calls = 0
-        self.abnormal = True
-
-    def minimum_inference_samples(self):
-        return {TARGET: 2, CANDIDATE: 2}
-
-    def snapshot_runtime_state(self):
-        return {"calls": self.calls}
-
-    def restore_runtime_state(self, snapshot):
-        self.restore_calls += 1
-        self.calls = snapshot["calls"]
-
-    def run(self, inference):
-        self.calls += 1
-        return {
-            "taskId": "prometheus-test",
-            "states": {TARGET: 0, CANDIDATE: 0},
-            "results": {
-                TARGET: {"currentAbnormalTimeRange": []},
-                CANDIDATE: {"currentAbnormalTimeRange": []},
-            },
-            "abnormalTimeRange": {
-                TARGET: (
-                    [
-                        {
-                            "startTime": "2026-08-05T11:00:00+00:00",
-                            "endTime": "2026-08-05T11:03:00+00:00",
-                            "abnormalType": "UP",
-                        }
-                    ]
-                    if self.abnormal
-                    else []
-                ),
-                CANDIDATE: [],
-            },
-            "associationAnalysis": {
-                "targets": {
-                    TARGET: {
-                        "events": [
-                            {
-                                "topAssociations": [
-                                    {"rank": 1, "metric": CANDIDATE, "score": 0.9}
-                                ]
-                            }
-                        ]
-                    }
-                }
-            },
-        }
-
-
-def _baseline():
-    timestamps = list(range(1, 31))
-    target_values = [1.0 + (index % 5 - 2) * 0.002 for index in timestamps]
-    candidate_values = [5.0 + (index % 5 - 2) * 0.01 for index in timestamps]
-    return fit_baseline_model(
-        {
-            TARGET: TimeSeries(timestamps, target_values),
-            CANDIDATE: TimeSeries(timestamps, candidate_values),
-        },
-        [TARGET, CANDIDATE],
-        source_type="prometheus",
-    )
-
-
-def _runtime_config(tmp_path: Path, policy: Path) -> PrometheusMonitorConfig:
-    return PrometheusMonitorConfig(
-        baseline_model=tmp_path / "baseline.json",
-        policy_config=policy,
-        prometheus=PrometheusConnectionConfig(
-            url="http://prometheus:9090",
-            global_step_query="training_global_step",
-            query_step_seconds=15,
-            lookback_seconds=3600,
-            overlap_seconds=30,
-            alignment_tolerance_seconds=8,
-        ),
-        queries=(
-            PrometheusMetricQuery(TARGET, "timing_metric", "target", "UP"),
-            PrometheusMetricQuery(CANDIDATE, "entropy_metric", "candidate", "BOTH"),
-        ),
-        target_metrics=(TARGET,),
-        candidate_metrics=(CANDIDATE,),
-        baseline=BaselineBootstrapConfig(),
-        target_selection=TargetSelectionConfig(),
+def _config(tmp_path: Path) -> MonitorConfig:
+    package = Path(__file__).resolve().parents[1]
+    return MonitorConfig(
+        prometheus_url="http://prometheus:9090",
+        series_selector='{__name__=~".+"}',
+        query_step_seconds=1,
+        lookback_seconds=3600,
+        alignment_tolerance_seconds=0.5,
+        timeout_seconds=30,
+        verify_tls=True,
+        baseline_start_step=5,
+        baseline_end_step=25,
+        minimum_baseline_samples=10,
+        inference_points=120,
         poll_interval_seconds=180,
-        inference_window_points=100,
-        state_file=tmp_path / "output" / "state.json",
+        top_k=5,
+        target_patterns=("time", "timing"),
+        global_step_patterns=("global_step",),
+        algorithm_config=package / "algorithm_config.yaml",
         output_dir=tmp_path / "output",
-        task_id="prometheus-test",
     )
 
 
-def test_repeated_abnormal_poll_writes_only_one_event_file(tmp_path: Path):
-    policy = tmp_path / "algorithm.yaml"
-    _write_policy(policy)
-    timestamps = [1000.0, 1015.0, 1030.0]
-    client = FakePrometheusClient(
-        TimeSeries(timestamps, [26, 27, 28]),
-        {
-            TARGET: TimeSeries(timestamps, [2.0, 2.1, 2.2]),
-            CANDIDATE: TimeSeries(timestamps, [7.0, 7.1, 7.2]),
-        },
-    )
-    runner = FakeRunner()
-    monitor = PrometheusMonitor(
-        _runtime_config(tmp_path, policy),
-        client=client,
-        baseline=_baseline(),
-        runner=runner,
-        now=lambda: FIXED_NOW,
-    )
+def _series_data():
+    labels = {"experiment": "smoke", "job": "trainer"}
+    global_step = PrometheusSeries("training_global_step", labels)
+    target = PrometheusSeries("rl_insight_timing_s_step", labels)
+    strong = PrometheusSeries("actor_entropy", labels)
+    normal = PrometheusSeries("critic_loss", labels)
+    short = PrometheusSeries("short_candidate", labels)
 
-    first = monitor.poll_once()
-    next_timestamps = timestamps + [1045.0]
-    client.global_steps = TimeSeries(next_timestamps, [26, 27, 28, 29])
-    client.metrics = {
-        TARGET: TimeSeries(next_timestamps, [2.0, 2.1, 2.2, 2.3]),
-        CANDIDATE: TimeSeries(next_timestamps, [7.0, 7.1, 7.2, 7.3]),
+    steps = list(range(1, 61))
+    timestamps = [1000.0 + step for step in steps]
+    healthy_wave = [((step % 5) - 2) for step in steps]
+    values = {
+        global_step.selector: TimeSeries(timestamps, steps),
+        target.selector: TimeSeries(
+            timestamps,
+            [
+                1.0 + wave * 0.002 if step <= 25 else 1.8 + wave * 0.002
+                for step, wave in zip(steps, healthy_wave)
+            ],
+        ),
+        strong.selector: TimeSeries(
+            timestamps,
+            [
+                10.0 + wave * 0.02 if step <= 25 else 18.0 + wave * 0.02
+                for step, wave in zip(steps, healthy_wave)
+            ],
+        ),
+        normal.selector: TimeSeries(
+            timestamps,
+            [5.0 + wave * 0.01 for wave in healthy_wave],
+        ),
+        short.selector: TimeSeries(timestamps[:3], [1.0, 1.1, 1.2]),
     }
-    second = monitor.poll_once()
-
-    assert first.status == "state_changed"
-    assert first.event_path is not None and first.event_path.is_file()
-    assert first.result is not None
-    assert first.result["events"][0]["targetMetric"] == TARGET
-    assert first.result["events"][0]["topAssociations"][0]["metric"] == CANDIDATE
-    assert second.status == "detected"
-    assert second.event_path is None
-    assert second.result is not None and second.result["events"] == []
-    assert len(list((tmp_path / "output").glob("event_*.json"))) == 1
-    state = json.loads((tmp_path / "output" / "state.json").read_text())
-    assert set(state["activeEventIds"]) == {TARGET}
+    return [global_step, target, strong, normal, short], values
 
 
-def test_unchanged_global_step_does_not_rerun_detector(tmp_path: Path):
-    policy = tmp_path / "algorithm.yaml"
-    _write_policy(policy)
-    timestamps = [1000.0, 1015.0, 1030.0]
-    client = FakePrometheusClient(
-        TimeSeries(timestamps, [26, 27, 28]),
-        {
-            TARGET: TimeSeries(timestamps, [2.0, 2.1, 2.2]),
-            CANDIDATE: TimeSeries(timestamps, [7.0, 7.1, 7.2]),
-        },
+def test_config_defaults_to_all_series_and_step_5_to_25(tmp_path: Path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "prometheus_url: http://prometheus:9090\n"
+        "algorithm_config: algorithm.yaml\n",
+        encoding="utf-8",
     )
-    runner = FakeRunner()
-    monitor = PrometheusMonitor(
-        _runtime_config(tmp_path, policy),
-        client=client,
-        baseline=_baseline(),
-        runner=runner,
-        now=lambda: FIXED_NOW,
-    )
+    (tmp_path / "algorithm.yaml").write_text("{}\n", encoding="utf-8")
 
-    first = monitor.poll_once()
-    second = monitor.poll_once()
+    config = load_config(config_path)
 
-    assert first.status == "state_changed"
-    assert second.status == "no_new_data"
-    assert runner.calls == 1
+    assert config.series_selector == '{__name__=~".+"}'
+    assert (config.baseline_start_step, config.baseline_end_step) == (5, 25)
+    assert config.target_patterns == ("time", "timing")
+    assert config.poll_interval_seconds == 180
 
 
-def test_normal_window_after_active_fault_emits_recovery(tmp_path: Path):
-    policy = tmp_path / "algorithm.yaml"
-    _write_policy(policy)
-    timestamps = [1000.0, 1015.0, 1030.0]
-    client = FakePrometheusClient(
-        TimeSeries(timestamps, [26, 27, 28]),
-        {
-            TARGET: TimeSeries(timestamps, [2.0, 2.1, 2.2]),
-            CANDIDATE: TimeSeries(timestamps, [7.0, 7.1, 7.2]),
-        },
-    )
-    runner = FakeRunner()
-    monitor = PrometheusMonitor(
-        _runtime_config(tmp_path, policy),
-        client=client,
-        baseline=_baseline(),
-        runner=runner,
-        now=lambda: FIXED_NOW,
-    )
-    abnormal = monitor.poll_once()
-    assert abnormal.result is not None
-    active_event_id = abnormal.result["events"][0]["eventId"]
+def test_query_train_detect_and_analyze_end_to_end(tmp_path: Path):
+    series, values = _series_data()
+    client = FakePrometheusClient(series, values)
+    config = _config(tmp_path)
+    runtime = PrometheusRuntime(config, client=client, now=lambda: FIXED_NOW)
 
-    runner.abnormal = False
-    next_timestamps = timestamps + [1045.0]
-    client.global_steps = TimeSeries(next_timestamps, [26, 27, 28, 29])
-    client.metrics = {
-        TARGET: TimeSeries(next_timestamps, [2.0, 2.1, 2.2, 1.0]),
-        CANDIDATE: TimeSeries(next_timestamps, [7.0, 7.1, 7.2, 5.0]),
+    queried = runtime.query()
+    assert queried["summary"] == {
+        "series": 5,
+        "globalSteps": 1,
+        "targets": 1,
+        "candidates": 3,
+        "failedQueries": 0,
     }
-    recovered = monitor.poll_once()
+    assert config.query_file.is_file()
+    assert queried["series"][1]["samples"]["values"]
 
-    assert recovered.status == "state_changed"
-    assert recovered.result is not None
-    assert recovered.result["events"] == [
-        {
-            "eventId": recovered.result["events"][0]["eventId"],
-            "eventType": "RECOVERED",
-            "detectedAt": FIXED_NOW.isoformat(),
-            "targetMetric": TARGET,
-            "activeEventId": active_event_id,
-            "topAssociations": [],
-        }
-    ]
-    assert monitor.state is not None and monitor.state.active_event_ids == {}
+    trained = runtime.train()
+    assert trained["trainingInterval"]["startStep"] == 5
+    assert trained["trainingInterval"]["endStep"] == 25
+    assert trained["summary"] == {
+        "discovered": 5,
+        "trained": 3,
+        "targets": 1,
+        "candidates": 2,
+        "skipped": 1,
+    }
+    assert trained["skippedSeries"][0]["metricName"] == "short_candidate"
+    assert config.training_file.is_file()
+
+    detected = runtime.detect()
+    assert detected["status"] == "abnormal"
+    assert detected["lastGlobalStep"] == 60
+    assert detected["summary"]["abnormalTargets"] == 1
+    target = detected["targets"][0]
+    assert target["metricName"] == "rl_insight_timing_s_step"
+    assert target["top5"][0]["metricName"] == "actor_entropy"
+    assert target["top5"][0]["abnormalContributionPercent"] == pytest.approx(100)
+    json.loads(config.result_file.read_text(encoding="utf-8"))
+
+    view = select_analysis(detected, "timing_s_step")
+    assert view["targets"][0]["top5"][0]["metricName"] == "actor_entropy"
 
 
-def test_missing_baseline_bootstraps_steps_5_to_25_then_detects(tmp_path: Path):
-    policy = tmp_path / "algorithm.yaml"
-    _write_policy(policy)
-    config = _runtime_config(tmp_path, policy)
-    steps = list(range(5, 36))
-    timestamps = [1000.0 + step * 15 for step in steps]
-    target_values = [1.0 + (step % 5 - 2) * 0.002 for step in steps]
-    candidate_values = [5.0 + (step % 5 - 2) * 0.01 for step in steps]
-    client = FakePrometheusClient(
-        TimeSeries(timestamps, steps),
-        {
-            TARGET: TimeSeries(timestamps, target_values),
-            CANDIDATE: TimeSeries(timestamps, candidate_values),
-        },
+def test_analyze_supports_metric_name_as_flag(tmp_path: Path, capsys):
+    config_path = tmp_path / "config.yaml"
+    algorithm = Path(__file__).resolve().parents[1] / "algorithm_config.yaml"
+    config_path.write_text(
+        f"algorithm_config: {algorithm}\noutput_dir: ./output\n",
+        encoding="utf-8",
     )
-    monitor = PrometheusMonitor(
-        config,
-        client=client,
-        now=lambda: FIXED_NOW,
+    output = tmp_path / "output"
+    output.mkdir()
+    (output / "anomalies.json").write_text(
+        json.dumps(
+            {
+                "targets": [
+                    {
+                        "id": "rl_timing_s_step{job=trainer}",
+                        "metricName": "rl_timing_s_step",
+                        "labels": {"job": "trainer"},
+                        "status": "abnormal",
+                        "intervals": [{"startTime": 1, "endTime": 2}],
+                        "top5": [
+                            {
+                                "rank": 1,
+                                "metricName": "actor_entropy",
+                                "abnormalContributionPercent": 100,
+                            }
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
     )
 
-    outcome = monitor.poll_once()
+    status = main(["analyze", "--config", str(config_path), "--time_step"])
 
-    assert outcome.status in {"detected", "state_changed"}
-    assert config.baseline_model.is_file()
-    fitted = load_baseline_model(config.baseline_model)
-    assert fitted.source_type == "prometheus"
-    assert fitted.metrics[TARGET].standard_samples == 21
-    assert fitted.metrics[CANDIDATE].standard_samples == 21
-    assert monitor.state is not None
-    assert monitor.state.last_global_step == 35
-    assert len(client.query_calls) == 2
+    assert status == 0
+    assert '"actor_entropy"' in capsys.readouterr().out

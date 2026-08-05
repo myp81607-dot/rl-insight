@@ -1,2 +1,0 @@
-# Optional dependency for SSH-polled VeRL training logs.
-paramiko>=3.4,<5

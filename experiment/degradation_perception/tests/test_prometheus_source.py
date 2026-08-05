@@ -20,6 +20,7 @@ from experiment.degradation_perception.perception_config import TimeSeries
 from experiment.degradation_perception.prometheus_source import (
     PrometheusDataError,
     PrometheusHttpClient,
+    PrometheusSeries,
     build_bootstrap_window,
     filter_after_global_step,
 )
@@ -99,6 +100,42 @@ def test_query_range_rejects_ambiguous_multiple_series():
 
     with pytest.raises(PrometheusDataError, match="returned 2 series"):
         client.query_range("timing_metric", start=1, end=2, step=1)
+
+
+def test_list_series_keeps_same_metric_with_different_labels_separate():
+    session = FakeSession(
+        FakeResponse(
+            {
+                "status": "success",
+                "data": [
+                    {"__name__": "timing", "instance": "trainer-1"},
+                    {"__name__": "timing", "instance": "trainer-0"},
+                ],
+            }
+        )
+    )
+    client = PrometheusHttpClient("http://prometheus:9090", session=session)
+
+    series = client.list_series('{__name__=~".+"}', start=1, end=2)
+
+    assert [item.identifier for item in series] == [
+        'timing{instance="trainer-0"}',
+        'timing{instance="trainer-1"}',
+    ]
+    assert series[0].selector == '{__name__="timing",instance="trainer-0"}'
+    url, kwargs = session.calls[0]
+    assert url == "http://prometheus:9090/api/v1/series"
+    assert kwargs["params"] == {
+        "match[]": '{__name__=~".+"}',
+        "start": 1.0,
+        "end": 2.0,
+    }
+
+
+def test_series_selector_escapes_label_values():
+    series = PrometheusSeries("metric", {"path": 'a\\b"c'})
+
+    assert series.selector == '{__name__="metric",path="a\\\\b\\\"c"}'
 
 
 def test_bootstrap_uses_one_latest_sample_for_each_distinct_step():
