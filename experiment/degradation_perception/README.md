@@ -1,13 +1,14 @@
-# RL-Insight 劣化感知：VeRL 日志运行指南
+# RL-Insight 劣化感知运行指南
 
-本目录保留现有 KDE、平稳段、多模态、异常点、异常区间和关联分析算法，并将
-真实 VeRL step-metrics 日志运行明确拆成三步：
+本目录保留现有 KDE、平稳段、多模态、异常点、异常区间和关联分析算法，并提供
+三种数据入口：
 
-- `fit`：读取正常 `healthy.log`，生成可复用的 `baseline_model.json`；
-- `detect`：加载基线和本地 inference 日志，生成一次性的 `result.json`；
-- `monitor`：启动时加载同一基线，通过 SSH 定时轮询远程 inference 日志。
+- `fit` / `detect`：读取本地 VeRL step-metrics 日志，完成离线拟合和检测；
+- `remote_monitor`：通过 SSH 定时轮询远程 inference 日志；
+- `prometheus_monitor`：通过 Prometheus HTTP API 自动拟合基线并持续检测。
 
-持续检测是 SSH 轮询，实际延迟取决于配置的轮询间隔，不是真正的流式推送。
+两种在线模式都是轮询，不是流式推送；实际延迟由各自的轮询间隔决定。离线检测
+仍然保留，适合回放历史日志和验证算法参数。
 
 ## 环境
 
@@ -146,54 +147,218 @@ python -m experiment.degradation_perception.remote_monitor \
 恢复 `lastStep` 和未完成缓冲。SSH、检测或写盘失败会记录错误并等待下一轮；失败
 轮次不会提交候选状态。在线模式不需要也不会读取 `healthy.log`，远端文件只读。
 
-## 4. Prometheus 轮询与自动基线
+## 4. Prometheus 在线检测：最短完整流程
 
-Prometheus 模式是已有 Prometheus HTTP API 的只读客户端，不会启动新端口。复制并
-修改示例配置，确保每条 PromQL 通过 `project`、`experiment_name`、`job`、
-`instance` 等标签唯一定位一条时序；如果确实需要合并副本，请在 PromQL 中显式
-使用 `sum`、`avg` 等聚合：
+Prometheus 模式只通过 HTTP API 读取已有 Prometheus 数据，算法本身不开放新端口。
+下面的命令都从仓库根目录执行。
+
+### 4.1 启动最小监控服务
+
+算法只依赖 Prometheus；保留 RL-Insight server 用于训练进程发现服务和自动注册
+`/metrics` 抓取地址，Tempo 和 Grafana 可以关闭：
+
+```bash
+cat > rl_insight/config/prometheus-only.yaml <<'YAML'
+server:
+  enable: true
+prometheus:
+  enable: true
+tempo:
+  enable: false
+grafana:
+  enable: false
+YAML
+
+rl-insight server install --config rl_insight/config/prometheus-only.yaml
+rl-insight server start --config rl_insight/config/prometheus-only.yaml --detach
+
+curl -sS http://127.0.0.1:18080/healthz
+curl -sS http://127.0.0.1:9090/-/ready
+```
+
+### 4.2 名称从训练代码产生
+
+`project`、`experiment_name` 和原始指标名都由训练代码决定，不是算法猜出来的：
+
+```python
+import rl_insight as insight
+
+insight.init(project="degradation-demo", experiment_name="smoke")
+insight.metric_gauge("training_global_step", step)
+insight.metric_gauge("timing_s_step", timing)
+insight.metric_gauge("actor_entropy", entropy)
+```
+
+启动训练前，在同一个容器或可访问 RL-Insight server 的训练环境中设置：
+
+```bash
+export RL_INSIGHT_SERVER_URL=http://127.0.0.1:18080
+python <training-entry.py> <training-arguments>
+```
+
+默认指标 namespace 是 `rl_insight_monitor`，所以上面的原始指标会暴露为：
+
+```text
+rl_insight_monitor_training_global_step
+rl_insight_monitor_timing_s_step
+rl_insight_monitor_actor_entropy
+```
+
+如果真实训练已经集成 RL-Insight，可以从代码和 Prometheus 两边确认名称：
+
+```bash
+rg -n 'insight\.init|metric_gauge|metric_count|metric_histogram' <training-repository>
+
+curl -sS http://127.0.0.1:9090/api/v1/targets | python -m json.tool
+curl -sS http://127.0.0.1:9090/api/v1/label/__name__/values | python -m json.tool
+curl -sS http://127.0.0.1:9090/api/v1/label/project/values | python -m json.tool
+curl -sS http://127.0.0.1:9090/api/v1/label/experiment_name/values | python -m json.tool
+```
+
+### 4.3 数据调用链和实际读取代码
+
+```text
+训练代码调用 insight.metric_gauge(...)
+→ RL-Insight Ray MonitorHub 在 :9092 暴露 /metrics
+→ RL-Insight server 将 :9092 注册为 Prometheus target
+→ Prometheus 按 scrape_interval 抓取并保存时序
+→ prometheus_monitor.py 读取 YAML 中的 PromQL
+→ PrometheusHttpClient 请求 /api/v1/query_range
+→ 响应被解析成 TimeSeries，进入基线拟合、检测和关联分析
+```
+
+关键代码位置：
+
+- `rl_insight/api.py::_emit`：把训练指标名、值和
+  `project` / `experiment_name` 标签发送给 MonitorHub；
+- `rl_insight/collector/ray_monitor_hub.py::MonitorHubActor`：开放 `:9092/metrics`
+  并向 RL-Insight server 注册抓取地址；
+- `prometheus_monitor.py::_query_window`：第 926 行读取 global step，第 932 行读取
+  YAML 中配置的全部 target/candidate 指标；
+- `prometheus_source.py::PrometheusHttpClient.query_range`：第 213 行的
+  `self.session.get(...)` 真正请求 Prometheus `/api/v1/query_range`；
+- `prometheus_source.py::_parse_matrix_result`：把 Prometheus matrix JSON 转成算法的
+  `TimeSeries`。
+
+直接查看负责读取的源码：
+
+```bash
+nl -ba experiment/degradation_perception/prometheus_monitor.py | sed -n '920,938p'
+nl -ba experiment/degradation_perception/prometheus_source.py | sed -n '197,252p'
+```
+
+### 4.4 配置 PromQL 和指标角色
 
 ```bash
 cp experiment/degradation_perception/prometheus_monitor_config.example.yaml \
-  prometheus_monitor_config.yaml
-cp experiment/degradation_perception/algorithm_config.yaml algorithm_config.yaml
+  /workspace/prometheus_monitor_config.yaml
+cp experiment/degradation_perception/algorithm_config.yaml \
+  /workspace/algorithm_config.yaml
 ```
 
-先执行一轮真实连接和数据检查：
+配置左侧是算法内部名称，右侧 `promql` 是 Prometheus 中的真实指标和训练标签：
+
+```yaml
+metrics:
+  timing_s/step:
+    promql: 'rl_insight_monitor_timing_s_step{project="degradation-demo", experiment_name="smoke"}'
+    role: auto
+    abnormal_type: UP
+  actor/entropy:
+    promql: 'rl_insight_monitor_actor_entropy{project="degradation-demo", experiment_name="smoke"}'
+    role: auto
+    abnormal_type: BOTH
+```
+
+名称包含 `time` 或 `timing` 的算法内部名称默认作为 target，其余指标默认作为
+association candidate；也可以用 `role` 或 `target_selection.overrides` 显式覆盖。
+每条 PromQL 必须通过 `project`、`experiment_name`、`job` 或 `instance` 等标签唯一
+定位一条时序；需要合并副本时，在 PromQL 中显式使用 `sum`、`avg` 等聚合。
+
+### 4.5 自动训练基线并启动轮询
+
+训练超过 step 25 后，先执行一轮。没有基线时会自动查询并使用 step 5 至 25 的
+已观测、已对齐样本拟合基线；生成后基线冻结，step > 25 才进入检测：
 
 ```bash
 python -m experiment.degradation_perception.prometheus_monitor \
-  --config prometheus_monitor_config.yaml \
+  --config /workspace/prometheus_monitor_config.yaml \
   --once
 ```
 
-持续轮询：
+启动后台轮询：
 
 ```bash
-python -m experiment.degradation_perception.prometheus_monitor \
-  --config prometheus_monitor_config.yaml
+nohup .venv/bin/python -u \
+  -m experiment.degradation_perception.prometheus_monitor \
+  --config /workspace/prometheus_monitor_config.yaml \
+  > /workspace/prometheus_monitor.log 2>&1 &
+
+echo $! > /workspace/prometheus_monitor.pid
+tail -f /workspace/prometheus_monitor.log
 ```
 
-`poll_interval_seconds` 默认是 180 秒，只控制多久发起一次请求；
-`prometheus.query_step_seconds` 默认是 15 秒，控制每次 `query_range` 返回的采样
-网格。每轮会从上次游标向前重叠两个采样间隔并按时间戳去重，不能把 query step
-设置成三分钟。
+`poll_interval_seconds` 默认 180 秒，表示多久查询一次；
+`prometheus.query_step_seconds` 默认 15 秒，表示 `query_range` 的采样网格，不能把它
+误设成三分钟。每轮会重叠查询一小段历史并按时间戳去重。
 
-如果 `baseline_model` 不存在，监控器会在 `lookback_seconds` 范围内查询
-`global_step_query`，默认将 global step 5 至 25 各取一个对齐样本，完成覆盖率、
-样本数和平稳段检查后调用现有 `fit_baseline_model`。生成的基线随即冻结，后续
-inference 不会更新它。基线已存在时直接加载，不会重新拟合。
+### 4.6 查看故障和关联结果
 
-指标名称不区分大小写地包含 `time` 或 `timing` 时默认作为 target，其余指标默认
-作为 association candidate。配置中的 `role` 或 `target_selection.overrides` 可以
-显式覆盖。每次检测都会原子覆盖 `<task_id>_latest.json`；只有 target 在 NORMAL、
-ABNORMAL、RECOVERED 之间发生状态变化时，才会额外生成带稳定 event ID 的
-`event_*.json`，因此相同故障不会每三分钟重复上报。
+```bash
+ls -lht /workspace/prometheus_output
+python -m json.tool \
+  /workspace/prometheus_output/degradation-prometheus-demo_latest.json
+```
 
-状态文件同时绑定 Prometheus 查询配置指纹和 baseline SHA-256。修改指标查询、
-target 规则、基线 step 范围或替换基线后，需要移动或删除旧状态文件；修改轮询
-周期或输出目录不要求重新训练基线。认证信息只能通过配置中指定的环境变量读取，
-不要把 token 或密码写入 YAML。
+- `<task_id>_latest.json`：最近一次完整检测结果，每次完成检测时原子覆盖；
+- `event_*.json`：只有 target 在 `NORMAL`、`ABNORMAL`、`RECOVERED` 之间变化时生成；
+- `monitor_state.json`：轮询游标、推理缓冲和活动事件状态，不是对外故障报告；
+- `states[metric] == 0`：只表示该指标检测流程成功完成，不表示一定正常；是否异常应
+  查看 `events`、`abnormalTimeRange` 和 `results[metric].message`。
+
+Prometheus 在线监控会把自动选中的 target 传给关联分析，不需要再单独运行一个
+关联命令。要得到 Top-5，必须先把候选指标全部加入 `metrics`，并确保它们从基线
+step 5 至 25 就有数据。当前关联模式只排名 target 故障窗口内自身也异常的候选；
+正常、常量、点数不足或时间覆盖不足的候选会记录在 `excludedMetrics` 中，而不会
+强行凑满五个：
+
+```yaml
+metrics:
+  gpu/utilization:
+    promql: 'rl_insight_monitor_gpu_utilization{project="degradation-demo", experiment_name="smoke"}'
+    role: auto
+    abnormal_type: BOTH
+```
+
+关联权重和数量在 `algorithm_config.yaml` 中调整：
+
+```yaml
+association:
+  enabled: true
+  target_metrics:
+    - timing_s/step
+  weights:
+    correlation: 0.5
+    random_forest: 0.5
+  top_k: 5
+  min_aligned_points: 10
+  min_rf_samples: 30
+  min_coverage_ratio: 0.6
+```
+
+结果位于：
+
+```text
+associationAnalysis.targets.<target>.events[].topAssociations
+```
+
+### 4.7 参数变更规则
+
+- 只修改 `poll_interval_seconds`、输出目录或 association 排名参数：重启监控即可；
+- 修改指标/PromQL、target 规则或基线 step 范围：换新的 `baseline_model`、
+  `state_file` 和 `task_id`，重新训练基线；
+- 修改 `alpha`、阈值 ratio、KDE 或平稳段参数：换新基线并重新拟合；
+- 认证信息只能通过配置指定的环境变量读取，不要把 token 或密码写入 YAML。
 
 ## 算法与输出
 
@@ -205,7 +370,7 @@ fit：读取正常日志
 → 计算每个指标的标准区间
 → 保存 baseline_model.json
 detect / monitor：加载 baseline_model.json
-→ 读取待检测日志
+→ 离线/SSH 模式读取日志，Prometheus 模式查询时序
 → 标记异常点
 → 合并异常区间
 → 输出 JSON
@@ -213,11 +378,13 @@ detect / monitor：加载 baseline_model.json
 
 核心返回字段保持不变：
 
-- `states`：指标检测流程状态；`states[metric] == 0` 只表示流程完成，不表示一定异常；
+- `states`：指标检测流程状态；`states[metric] == 0` 只表示流程完成，既不等于正常
+  也不等于异常；
 - `abnormalTimeRange`：经现有规则确认的正式异常区间；
 - `results`：当前核心实现的检测详情、逐点诊断和阈值；
 - `metricErrors`：可选的指标级错误；
-- `associationAnalysis`：仅在现有配置明确开启时出现。
+- `associationAnalysis`：在策略开启关联分析，或调用方显式传入 association target
+  时出现；Prometheus 在线监控会自动传入选中的 target。
 
 适配层增加 `debugDetails.metrics`。每个成功建模的指标分别保存：
 
@@ -228,20 +395,23 @@ detect / monitor：加载 baseline_model.json
 - 平稳 segment 的 step 范围和峰影响区间。
 
 多正常模式保存在 `normalModels` 的多个独立元素中，不取平均、不合并阈值。
-在线 JSON 还包含 `metadata`：任务轮次、本轮新增 step 范围、检测前 inference
-缓冲范围、检测时间、各指标点数以及 `lastStepBefore/lastStepAfter`。
+在线 JSON 还包含 `metadata`。SSH 模式记录新增 step、检测前后游标和 inference
+缓冲范围；Prometheus 模式记录查询时间范围、查询网格、轮询周期、
+`lastGlobalStep`、选中指标和各指标点数。
 
 ## 注意事项
 
 - `healthy.log` 必须是已确认正常的数据，只在 `fit` 阶段读取；
 - inference 数据不会进入正常基线，且不保证一定出现异常；
-- 在线和离线检测使用同一个 `baseline_model.json`；
+- 在线和离线检测使用相同的基线模型格式，但不同数据源、指标或查询配置不应复用
+  同一个基线文件；
 - 更换设备、模型、卡数、代码版本或训练配置后，通常需要重新 `fit`；
 - 日志中的时间表示 step，SSH 数据仍以 `source_type=training_log` 调用算法；
-- 指标名始终保留原始形式；
+- 日志模式保留日志中的原始指标名；Prometheus 模式由 YAML 左侧定义算法内部名称，
+  并由右侧 PromQL 映射真实 Prometheus 指标；
 - 内部 KDE、分位数和阈值判断不做提前四舍五入；
 - SSH 默认拒绝未知 host key，可使用系统 known_hosts 或配置 `known_hosts`；
-- 密码应通过 `password_env` 指定的环境变量提供，不写进配置文件。
+- 密码应通过 `password_env` 指定的环境变量提供，不写进配置文件；
 - 在线监控是按 `poll_interval_seconds` 轮询，不是流式推送。
 
 ## 测试
