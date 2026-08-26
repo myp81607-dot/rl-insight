@@ -24,6 +24,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+degradation = [
+  "numpy",
+  "scikit-learn",
+  "scipy",
+]
 recipe = [
   "numpy",
   "pandas",
@@ -35,7 +40,10 @@ recipe = [
   "ijson",
 ]
 test = [
+  "numpy",
   "pytest",
+  "scikit-learn",
+  "scipy",
 ]
 
 [project.scripts]
