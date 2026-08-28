@@ -1,67 +1,129 @@
 # Diagnostic experience
 
-These incomplete, fallible cases are weak priors only. Always combine the
-model's own technical knowledge with the actual grouped evidence.
+These priors summarize failure mechanisms represented by controlled test
+scenarios. They are not fault-injection instructions and do not assert direct
+observation of signals absent from the association evidence.
 
-The four fault labels below are this skill's diagnostic vocabulary, not four
-official Huawei fault-class names. Here, `AI Core overload` means a Cube/matrix
-compute-side bottleneck, while `AI Vector overload` means a Vector compute-side
-bottleneck.
+The evidence categories (`latency`, `training_quality`, `rollout_quality`,
+`data_characteristics`, `hardware_resources`, `vllm_engine`, and
+`transfer_queue`) organize metrics; they are not fault domains. Never select a
+domain by category size alone. `association_percent` is temporal association
+strength, not fault probability or causal contribution. Time-trend metrics such
+as `training_epoch` and `tq_controller_uptime_seconds` require corroboration.
 
-## Distinguishing evidence
+## Diagnostic vocabulary
 
-- `AI Core overload`: prefer this when Cube-side evidence dominates, such as
-  sustained `aic_time`, `aic_total_cycles`, `aic_cube_ratio`, `mac`, or Cube
-  FLOPs together with compute latency or throughput degradation. Stable
-  frequency and healthy device/core evidence strengthen this diagnosis. A
-  dominant Vector ratio argues against it.
-- `AI Vector overload`: prefer this when Vector-side evidence dominates, such
-  as sustained `aiv_time`, `aiv_total_cycles`, `aiv_vec_ratio`, `vec`, or
-  Vector FLOPs together with affected latency or throughput. An `aivec error`
-  tied to a core ID is Vector-specific evidence, but an exception may indicate
-  a software or hardware fault rather than overload. Dominant Cube work argues
-  against this diagnosis.
-- `NPU frequency throttling`: prefer this when current AI Core frequency falls
-  below its normal or rated level while AI tasks remain active, and the drop is
-  temporally coherent with performance loss and temperature, power, or
-  overtemperature evidence. A low frequency while no AI task is running can be
-  a normal low-power state and is not sufficient evidence.
-- `NPU core offline`: prefer this for abrupt, severe, and persistent capacity
-  loss accompanied by a disappeared core/device/rank, zero or flat activity
-  while peers remain active, repeated errors on the same chip/core ID, ECC/RAS
-  events, unhealthy device state, or abnormal AI Core diagnosis/stress results.
-  If degradation is exceptionally severe and is strongly associated with an
-  NPU frequency reduction, elevate this diagnosis above ordinary throttling
-  when the loss persists or any independent offline/hardware signal is present.
-  Frequency reduction alone still supports throttling, not core offline.
+### Compute
 
-Direct hardware and profiler signals outrank indirect category patterns. When
-they are absent, use coherent latency, `hardware_resources`, `vllm_engine`,
-`rollout_quality`, and `transfer_queue` evidence only as indirect support and
-lower confidence rather than inventing a hardware observation.
+- `NPU frequency throttling`: reduced active compute capacity consistent with a
+  lower operating frequency. Prefer it for a relatively broad, sustained
+  slowdown without evidence of a disappeared device or rank. Idle low frequency
+  is normal and frequency must not be claimed unless directly observed.
+- `NPU core offline`: the experiment label for abrupt, severe, persistent loss
+  of effective NPU compute capacity. It may represent localized capacity being
+  unavailable or fully occupied; do not translate this label into a claim of
+  physical core disappearance, ECC/RAS failure, or device removal without a
+  direct signal.
+- `AI Core overload`: contention concentrated in Cube/matrix compute. Direct
+  AIC/Cube utilization or profiler evidence distinguishes it best; otherwise a
+  compute-heavy target slowdown with stable sequence length is only indirect
+  support.
+- `AI Vector overload`: contention concentrated in Vector compute. Direct
+  AIV/Vector utilization or profiler evidence distinguishes it best. The
+  current catalog alone may not reliably separate it from AI Core overload.
 
-These are not category-to-fault mappings. Do not decide by category count or an
-experience example alone. Weigh metric semantics, association strength,
-direction, labels, correlation/random-forest availability, temporal coherence,
-event phase, supporting evidence, and contradictions.
+Evidence that weakens Compute: prompt, response, or global sequence length grows
+with the latency; vLLM waiting or transfer backlog dominates without coherent
+compute evidence; the event is a brief stall followed by rapid recovery.
 
-Return exactly one of the four fault labels. If evidence is weak or mixed, choose
-the best-supported label with `Low` confidence and state the limitation without
-listing an alternative diagnosis.
+### Network
 
-## Official Ascend sources
+- `Endpoint NIC bandwidth constraint`: sustained parameter-plane communication
+  capacity limitation at an endpoint.
+- `Switch-port egress bandwidth constraint`: sustained limitation on the
+  egress path of a switch port.
+- `Interface QoS/CAR-induced restriction`: policy-driven sustained or bursty
+  capacity restriction; policing may drop or remark excess traffic, while
+  shaping may buffer it.
+- `Transient parameter-plane link interruption`: abrupt communication stall,
+  often followed by recovery or a closed event, consistent with a temporary
+  link interruption.
 
-- [ArithmeticUtilization field definitions](https://www.hiascend.com/document/detail/en/canncommercial/850/devaids/optool/atlasopdev_16_0093.html)
-  distinguish AI Cube Core and AI Vector Core execution time, cycles, ratios,
-  and FLOPs.
-- [PipeUtilization field definitions](https://www.hiascend.com/document/detail/en/canncommercial/850/devaids/optool/atlasopdev_16_0099.html)
-  distinguish Cube, Vector, scalar, and memory-transfer pipeline time and ratios.
-- [AI Core frequency viewing](https://www.hiascend.com/document/detail/en/canncommercial/850/devaids/profiling/atlasprofiling_16_0059.html)
-  explains that frequency reduction degrades active-task performance, can be
-  temperature protection, and can also be a normal idle low-power state.
-- [AI Core error symptoms](https://www.hiascend.com/document/detail/en/canncommercial/850/maintenref/troubleshooting/troubleshooting_0004.html)
-  identifies `aivec`/`aicore` exceptions and the diagnostic value of chip, die,
-  and core IDs.
-- [AI Core error locating](https://www.hiascend.com/document/detail/en/canncommercial/800/maintenref/troubleshooting/troubleshooting_0005.html)
-  uses RAS events, ECC evidence, repeated same-chip failures, and Ascend DMI
-  stress results to distinguish possible hardware faults from software faults.
+Prefer Network when communication-heavy timing rises while throughput or MFU
+falls and sequence-length features remain stable. Transfer-queue backlog is
+propagation evidence, not proof of a parameter-plane fault. With the current
+catalog, the first three sustained restrictions are usually observationally
+equivalent; rank them as possible causes without pretending to locate the
+restriction. Abrupt stall and rapid recovery weakly favor transient interruption.
+
+Evidence that weakens Network: only rollout generation or vLLM metrics degrade;
+data length grows coherently; or no communication-related timing/throughput
+effect is present. Do not claim observed packet loss, CAR, NIC rate limiting, or
+link down without direct counters or logs.
+
+### Host CPU
+
+- `Host CPU core offline`: reduced scheduler-visible CPU capacity consistent
+  with one or more host cores becoming unavailable.
+- `Host CPU overload`: runnable work saturates available host CPU capacity and
+  delays input, orchestration, serialization, or request handling.
+- `Host CPU frequency throttling`: broad host-side work slows because effective
+  CPU frequency is reduced.
+
+Prefer Host CPU when CPU memory/resource evidence and host-sensitive latency or
+queueing move together while NPU-oriented throughput effects appear secondary.
+Direct CPU online-state, utilization/pressure, and frequency counters are needed
+to distinguish the three causes reliably. The current catalog does not justify
+claiming that a CPU was actually offlined, saturated, or frequency-limited.
+
+Evidence that weakens Host CPU: isolated NPU compute evidence, isolated network
+communication effects, or sequence-length growth fully explains the event.
+
+### HBM
+
+- `HBM congestion`: periodic or progressively stronger contention for NPU HBM
+  capacity or memory bandwidth, causing compute and rollout work to wait. This
+  label does not imply continuous saturation or defective memory.
+
+Prefer HBM when NPU memory allocation/resource evidence, latency, and throughput
+degradation are temporally coherent, especially when the severity varies over
+time while sequence length remains stable. Allocated or reserved memory alone
+does not measure bandwidth congestion. Direct HBM bandwidth/pressure evidence
+is required for a high-confidence subtype claim.
+
+Evidence that weakens HBM: stable memory evidence, a purely communication-shaped
+stall, or a data-length increase that explains the memory and latency changes.
+
+## Synthesis rules
+
+1. Match the exact target event and phase before diagnosing. Confirmed and
+   closed transitions receive separate reports.
+2. Read all metrics in the grouped Top-25. Use direction, labels, temporal
+   coherence, metric meaning, global rank, and contradictions; do not count
+   category members as votes.
+3. Treat data-characteristic changes as workload confounders before attributing
+   latency to infrastructure. Treat training/rollout quality as downstream
+   effects unless their semantics directly support a cause.
+4. Rank two distinct domains and three or four specific causes. Causes should
+   normally come from the two ranked domains. If evidence is weak, use `Low`
+   confidence and state the missing discriminator, but still make an ordered
+   best judgment.
+5. Keep the reasoning concise and professional. Do not invent profiler, network,
+   frequency, CPU, HBM, ECC/RAS, or device-health observations.
+
+## Technical sources
+
+- [Ascend AI Core architecture](https://www.hiascend.com/document/detail/en/canncommercial/850/opdevg/Ascendcopdevg/atlas_ascendc_10_0015.html)
+  describes Cube, Vector, and scalar compute units.
+- [Ascend ArithmeticUtilization fields](https://www.hiascend.com/document/detail/en/canncommercial/850/devaids/optool/atlasopdev_16_0093.html)
+  distinguish AI Cube Core and AI Vector Core execution evidence.
+- [Ascend PyTorch Profiler MemoryAccess](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/900/devaids/Profiling/atlasprofiling_16_0033.html)
+  documents memory-access and bandwidth analysis.
+- [HCCL alpha-beta model](https://www.hiascend.com/document/detail/en/canncommercial/850/commlib/hcclug/hcclug_000115.html)
+  relates communication time to latency and per-byte transfer cost.
+- [Huawei traffic policing and shaping](https://info.support.huawei.com/enterprise/en/doc/EDOC1100419255/13e69fa0/traffic-policing-and-traffic-shaping-configuration)
+  distinguishes CAR policing from buffered shaping.
+- [Linux CPU hotplug](https://docs.kernel.org/core-api/cpu_hotplug.html),
+  [CPUFreq](https://docs.kernel.org/admin-guide/pm/cpufreq.html), and
+  [Pressure Stall Information](https://docs.kernel.org/accounting/psi.html)
+  define direct host CPU availability, frequency, and contention signals.

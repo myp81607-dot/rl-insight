@@ -86,7 +86,7 @@ python -m experiment.degradation.cli monitor \
 Do not use `run-once` to bootstrap continuous monitoring. `monitor` performs
 baseline initialization and remains running until stopped. The CLI is a
 foreground process; an agent that must keep responding while it runs should keep
-it in a persistent background terminal/session rather than starting a second
+it attached to one persistent terminal/session rather than starting a second
 command after baseline training.
 
 After starting `monitor`, the agent should keep the task active and continue
@@ -103,6 +103,12 @@ series. The runtime then uses every discovered metric in the configured target
 and candidate catalogs. Supply a narrower selector only intentionally; do not
 guess a trainer/job label. The global-step instant query must still return
 exactly one series.
+
+An agent should first use the default Prometheus URL
+`http://127.0.0.1:9090` and reuse the established absolute state directory for
+the task. If that URL is unreachable or the state directory cannot be
+established, it should ask whether the Prometheus URL and state directory need
+to be changed instead of guessing an alternate URL, path, or label selector.
 
 Common operations:
 
@@ -139,18 +145,25 @@ Correlation and random-forest association are always active. Runtime analyzes
 and persists evidence at both confirmed and closed transitions. An agent watching
 the monitor should immediately inspect `show --event all --phase both` and report
 exactly one event matched by target metric plus `confirmed_at_step` or
-`closed_at_step`, then report its considered fault type and association metrics.
-For a valid unique event, it must choose exactly one of `AI Core overload`,
-`AI Vector overload`, `NPU frequency throttling`, or `NPU core offline`, with
-`High`, `Medium`, or `Low` confidence. Even weak evidence requires the single
-best-supported type; `Undetermined`, combined diagnoses, and alternative lists
-are not valid outputs.
+`closed_at_step`. Confirmed and closed are separate reports for each target
+transition, not reports for each associated candidate metric.
+
+For a valid unique event, the agent ranks two distinct fault domains from
+`Compute`, `Network`, `Host CPU`, and `HBM`, assigns `High`, `Medium`, or `Low`
+confidence, and lists three or four ordered specific causes. It then prints all
+metrics in every non-empty `top_k_by_category` block, preserving the complete
+stored Top-25 (or every returned entry when fewer than 25 are available),
+`global_rank`, association percentage, direction, and identifying labels. It
+must not reduce the evidence to representative metrics or treat association
+percentage as fault probability.
 
 Diagnostic experience is an incomplete, fallible prior. The agent must combine
 its own technical knowledge with metric semantics, scores, direction, labels,
 correlation/random-forest evidence, phase, temporal context, and contradictions.
-Category count or an experience example alone must not decide the fault type.
-When event matching is not unique, report ambiguity and do not diagnose.
+Category count or an experience example alone must not decide the domains or
+causes, and absent direct hardware/network/OS signals must not be presented as
+observed facts. When event matching is not unique, report ambiguity and do not
+diagnose.
 
 If monitoring exits non-zero, preserve and report the original status and stderr,
 then run read-only `check` and offline `show` independently. Report the likely

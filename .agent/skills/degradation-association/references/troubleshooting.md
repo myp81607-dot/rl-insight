@@ -7,6 +7,9 @@ require it before offline `show` or `reset`.
 
 ## Prometheus request fails
 
+- The first attempt uses `http://127.0.0.1:9090`. If it is unreachable, ask the
+  user whether the Prometheus URL and state directory should be changed. Do not
+  guess another endpoint, state path, or task selector.
 - Confirm the URL points to Prometheus itself, commonly port 9090, rather than a
   training service or model endpoint.
 - Test the Prometheus readiness endpoint and API reachability from the same host
@@ -106,6 +109,9 @@ require it before offline `show` or `reset`.
 - Only `invalid_state` is a state-level exit `1`. Connectivity, dependency,
   argument, and explicit phase-selection failures are separate command errors.
 - Use a separate `--state-dir` per independent training task or experiment.
+- If the intended absolute state directory cannot be established, ask whether
+  it and the Prometheus URL should be changed; do not silently create or select
+  another task's state directory.
 
 ## Python import fails
 

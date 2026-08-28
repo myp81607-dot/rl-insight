@@ -1,6 +1,6 @@
 ---
 name: degradation-association
-description: "Operate rl-insight's Prometheus-backed degradation experiment: train or load a baseline, monitor continuously, inspect confirmed/closed association evidence, and report one evidence-backed fault type."
+description: "Continuously operate rl-insight's Prometheus-backed degradation experiment: train or load a baseline, report every confirmed/closed target transition, preserve the grouped Top-25 evidence, and infer ranked fault domains and causes."
 user_invocable: true
 ---
 
@@ -18,9 +18,14 @@ evidence; do not reimplement its algorithms in the skill.
    directory. Keep one state directory per training task.
 3. Verify the optional runtime before detection. If it is missing, report it and
    obtain approval before running `pip install -e ".[degradation]"`.
-4. Obtain a Prometheus URL. Omit `--series-selector` by default so discovery uses
-   all Prometheus series. Never invent a trainer/job selector. Use a narrower
-   selector only when the user explicitly supplies or requests one.
+4. Start with the default Prometheus URL `http://127.0.0.1:9090`. Reuse the
+   established absolute state directory for this training task. If the default
+   URL is unreachable or the state directory cannot be established, ask the
+   user whether the Prometheus URL and state directory should be changed. Do
+   not guess an alternate URL, path, or task label.
+5. Omit `--series-selector` by default so discovery uses all Prometheus series.
+   Never invent a trainer/job selector. Use a narrower selector only when the
+   user explicitly supplies or requests one.
 
 Read [algorithm-contract.md](references/algorithm-contract.md) before changing
 parameters. Read [troubleshooting.md](references/troubleshooting.md) after a
@@ -43,8 +48,9 @@ If `check` reports `error_kind=no_candidate_metrics`, stop; do not start
 Do not require `check` before offline `show` or `reset`; they operate only on
 persisted local state and must remain usable when Prometheus is unavailable.
 
-When the user asks to start monitoring, run `monitor` directly in a persistent
-background terminal/session:
+On a bare invocation of this skill, or when the user asks to start monitoring,
+run `monitor` directly as a foreground process inside one persistent
+terminal/session:
 
 ```bash
 python -m experiment.degradation.cli monitor \
@@ -56,9 +62,9 @@ Do not run `run-once` first and do not wait for another user prompt to start
 `monitor`. If no baseline exists, this same process collects 30 complete new
 steps, writes the baseline after observing the next-step boundary, and then
 continues detection without exiting. If a baseline exists, it loads it and
-continues detection immediately. Keep the background session alive until the
-user asks to stop. The CLI remains a foreground process inside that persistent
-session; do not describe it as a project daemon.
+continues detection immediately. Keep the task attached to that same session,
+poll its output repeatedly, and keep it alive until the user asks to stop. Do
+not detach, daemonize, interrupt, replace, or prematurely restart a live monitor.
 
 Do not finish the task after starting `monitor`. Keep waiting on the same
 terminal/session until the user explicitly asks to stop. Do not return a final
@@ -159,32 +165,44 @@ knowledge with metric meaning, score, direction, correlation/random-forest
 availability, labels, phase, temporal context, category evidence, and
 contradictions. Category size and experience examples must not decide the result.
 
-For every valid event phase, choose exactly one of these fault types:
+For every valid event phase, rank these fault domains:
 
-- `AI Core overload`
-- `AI Vector overload`
-- `NPU frequency throttling`
-- `NPU core offline`
+- `Compute`
+- `Network`
+- `Host CPU`
+- `HBM`
 
-Always return the single best-supported type. When evidence is weak or mixed,
-still choose one and set confidence to `Low`; never output `Undetermined`, list
-alternatives, combine fault types, or hedge the final diagnosis.
+Return the two best-supported, distinct domains in order and three or four
+ranked specific causes from the vocabulary in
+[diagnostic-experience.md](references/diagnostic-experience.md); do not add new
+domain or cause labels.
+The second domain may have `Low` confidence, but do not omit it or assign fake
+numeric probabilities. These are diagnostic hypotheses, not claims that an
+unobserved hardware, network, or operating-system signal was measured.
 
-Start the answer with exactly:
+Start each confirmed or closed transition report with exactly:
 
 ```text
-Abnormal target metric: <target metric>
-Considered fault type: <exactly one allowed fault type> (confidence: High|Medium|Low)
-Reference association metrics: <metric names with association percentages>
+Abnormal target metric: <metric and identifying labels>
+Event phase: confirmed|closed
+Most likely fault domain: Compute|Network|Host CPU|HBM (confidence: High|Medium|Low)
+Second likely fault domain: Compute|Network|Host CPU|HBM (confidence: High|Medium|Low)
+Likely fault causes:
+1. <specific cause> — <brief evidence basis>
+2. <specific cause> — <brief evidence basis>
+3. <specific cause> — <brief evidence basis>
+[4. <specific cause> — <brief evidence basis>]
+Reasoning basis: <two or three concise professional sentences>
 ```
 
-For a live transition, immediately add `Event phase: confirmed|closed`. Then show
-one concise `Reasoning basis:` that states the strongest supporting evidence and
-material contradiction without proposing another fault type. Then show each
-non-empty English category block and every returned metric concisely, keeping
-`global_rank` order and including association percentage and direction. Do not
-translate category names, metric names, or fault types. Treat percentages as
-relative evidence, not causal contribution or degradation magnitude.
+Then print `Association evidence categories:` followed by each non-empty English
+category block and every metric in the stored Top-25, or every returned entry
+when fewer than 25 are available. Preserve `global_rank` order and include
+identifying labels, association percentage, direction, and rank for every item;
+never shorten the block to a few representative metrics.
+Do not translate category names, metric names, domains, or causes. Treat
+association percentage as relative evidence, not fault probability, causal
+contribution, or degradation magnitude.
 
 ## Reset safely
 
