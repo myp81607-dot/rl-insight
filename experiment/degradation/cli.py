@@ -128,7 +128,7 @@ def _add_runtime_arguments(
         default=DEFAULT_SERIES_SELECTOR,
         help=(
             "PromQL selector for discovery and range queries; the global-step "
-            "instant query must still be unique in v0.1."
+            "instant query must still be unique."
         ),
     )
     parser.add_argument("--request-timeout", type=float, default=30.0)

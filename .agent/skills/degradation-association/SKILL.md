@@ -1,236 +1,269 @@
 ---
 name: degradation-association
-description: "Continuously operate rl-insight's Prometheus-backed degradation experiment: train or load a baseline, report every confirmed/closed target transition, preserve the grouped Top-25 evidence, and infer ranked fault domains and causes."
+description: "Continuously detect RL training latency degradation from Prometheus, associate candidate metrics with abnormal target events, present the complete grouped Top-25, and infer ranked fault domains and causes."
 user_invocable: true
 ---
 
 # Degradation association
 
-Use the deterministic implementation in `experiment/degradation`. Interpret its
-evidence; do not reimplement its algorithms in the skill.
+Operate the deterministic implementation in `experiment/degradation`; do not
+reimplement its KDE, 3-of-5 event lifecycle, association ranking, persistence,
+or presentation logic.
 
-## Prepare
+Read [algorithm-contract.md](references/algorithm-contract.md), the concise
+skill-facing algorithm contract, before operating the detector or changing
+parameters. Consult [docs/algorithm.md](../../../docs/algorithm.md) only when
+implementation-level detail is needed. Read
+[diagnostic-experience.md](references/diagnostic-experience.md) only for a valid
+selected abnormal event. Read [troubleshooting.md](references/troubleshooting.md)
+after a failed command or `invalid_state`.
+
+## 1. Environment Check
 
 1. Locate the rl-insight checkout containing `experiment/degradation/cli.py` and
-   run every command with that checkout as the working directory. The experiment
-   is source-tree code and is not installed in the wheel.
-2. Pass an absolute `--state-dir`, especially after changing the working
-   directory. Keep one state directory per training task.
-3. Verify the optional runtime before detection. If it is missing, report it and
-   obtain approval before running `pip install -e ".[degradation]"`.
-4. Start with the default Prometheus URL `http://127.0.0.1:9090`. Reuse the
-   established absolute state directory for this training task. If the default
-   URL is unreachable or the state directory cannot be established, ask the
-   user whether the Prometheus URL and state directory should be changed. Do
-   not guess an alternate URL, path, or task label.
-5. Omit `--series-selector` by default so discovery uses all Prometheus series.
-   Never invent a trainer/job selector. Use a narrower selector only when the
-   user explicitly supplies or requests one.
+   run commands from that repository root. This experiment is source-tree code,
+   not part of the published wheel.
+2. Unless the user supplies another path, resolve
+   `~/.local/state/rl-insight/degradation/default` to an absolute path and use it
+   as `--state-dir`. Use a separate absolute directory for another training task
+   and reuse the selected directory for every command.
+3. Verify the degradation dependencies. If they are missing, report that fact
+   and obtain approval before running `pip install -e ".[degradation]"`.
+4. Start with `http://127.0.0.1:9090`. If it is unreachable or the default state
+   directory cannot be created or accessed, ask whether the Prometheus URL and
+   state directory should be changed. Do not guess another URL, path, or task
+   label.
 
-Read [algorithm-contract.md](references/algorithm-contract.md) before changing
-parameters. Read [troubleshooting.md](references/troubleshooting.md) after a
-failed command or `invalid_state`.
+Persisted files are:
 
-## Operate
+```text
+<absolute-state-dir>/standard_data.json   # fitted baseline
+<absolute-state-dir>/abnormal_data.json   # confirmed/closed events and Top-25
+```
 
-Run the read-only `check` before starting detection:
+## 2. Online Data Access
+
+Run the read-only preflight before `run-once` or `monitor`:
 
 ```bash
 python -m experiment.degradation.cli check \
   --prometheus-url http://127.0.0.1:9090 \
-  --state-dir /absolute/path/to/degradation-state
+  --state-dir "$HOME/.local/state/rl-insight/degradation/default"
 ```
 
-Confirm one integer-valued global-step series, at least one configured target,
-at least one configured candidate, the required dependencies, and valid state.
-If `check` reports `error_kind=no_candidate_metrics`, stop; do not start
-`run-once` or `monitor`. Check the selector, metric export, and Prometheus data.
-Do not require `check` before offline `show` or `reset`; they operate only on
-persisted local state and must remain usable when Prometheus is unavailable.
+Proceed only when `check` confirms one integer-valued global-step series, at
+least one configured target, at least one configured candidate, the required
+dependencies, and valid persisted state. Stop on
+`error_kind=no_candidate_metrics` and inspect the selector, metric export, and
+Prometheus data.
 
-On a bare invocation of this skill, or when the user asks to start monitoring,
-run `monitor` directly as a foreground process inside one persistent
-terminal/session:
+Omit `--series-selector` by default. The core selector `{__name__=~".+"}`
+discovers all Prometheus series and then keeps every discovered configured target
+and candidate. Never narrow discovery to trainer, job, or another guessed label
+set. Use a narrower selector only when the user explicitly supplies or requests
+one.
 
-```bash
-python -m experiment.degradation.cli monitor \
-  --prometheus-url http://127.0.0.1:9090 \
-  --state-dir /absolute/path/to/degradation-state
-```
-
-Do not run `run-once` first and do not wait for another user prompt to start
-`monitor`. If no baseline exists, this same process collects 30 complete new
-steps, writes the baseline after observing the next-step boundary, and then
-continues detection without exiting. If a baseline exists, it loads it and
-continues detection immediately. Keep the task attached to that same session,
-poll its output repeatedly, and keep it alive until the user asks to stop. Do
-not detach, daemonize, interrupt, replace, or prematurely restart a live monitor.
-
-Do not finish the task after starting `monitor`. Keep waiting on the same
-terminal/session until the user explicitly asks to stop. Do not return a final
-answer after startup or baseline completion.
-
-When the session logs `Trained <count> baselines from steps <start>-<end>;
-skipped <count> series`, immediately notify the user:
-
-```text
-Baseline ready: trained <count> baselines from steps <start>-<end>; skipped <count> series. Monitoring continues in the same process.
-```
-
-This notification is not a completion signal. Do not stop, close, interrupt,
-restart, or replace the monitor process after sending it; continue watching the
-same session for confirmed and closed events.
-
-Omitting `--series-selector` uses the core default `{__name__=~".+"}`. This
-discovers all Prometheus series, after which the runtime uses every discovered
-configured target and candidate. Do not silently narrow discovery to
-`job="training"`, trainer metrics, or any other guessed label set. Association
-analysis is enabled by default and runs automatically for every confirmed and
-closed target event.
-
-Use `run-once` only when the user explicitly requests a one-time validation or
-single poll:
+Use `run-once` only when the user explicitly requests one initialization and
+detection poll:
 
 ```bash
 python -m experiment.degradation.cli run-once \
   --prometheus-url http://127.0.0.1:9090 \
-  --state-dir /absolute/path/to/degradation-state
+  --state-dir "$HOME/.local/state/rl-insight/degradation/default"
 ```
 
-Keep watching the persistent monitor session. On every `Confirmed event` or
-`Closed event` transition, immediately run `show --event all --phase both`,
-then match exactly one stored event by the logged target metric and transition
-step: use `confirmed_at_step` for confirmed and `closed_at_step` for closed. Read
-only that event's matching phase. If zero or multiple events match, report the
-ambiguity and do not guess or generate a fault hypothesis. Otherwise report the
-abnormal information, considered fault type, and association evidence to the
-user. Do not wait for another inspection request. A detached process without an
-active wait or monitoring task is insufficient because it cannot deliver this
-diagnosis.
+Local `show` and `reset` read persisted state and do not require Prometheus.
 
-If `monitor` exits non-zero, immediately report its exact exit status and stderr.
-Run read-only `check` and offline `show` as independent diagnostics, read the
-matching section of [troubleshooting.md](references/troubleshooting.md), and
-report the likely cause and next action. Do not generate an event fault
-hypothesis from a command failure.
+## 3. RL Latency Anomaly and Association Detection
 
-Automatically correct only an equivalent working directory, known existing
-environment, absolute state path, or command syntax, then retry a read-only
-command once. A transient Prometheus timeout, connection reset, or HTTP 5xx may
-restart `monitor` once with identical arguments only after the old process exits.
-Read [troubleshooting.md](references/troubleshooting.md) for the full boundary;
-anything that changes dependencies, configuration, state, code, or a live
-process requires approval.
+On a bare invocation of this skill, or when the user asks to start monitoring,
+complete Sections 1 and 2, then run `monitor` after a successful `check`. Start
+it without an intervening `run-once`:
 
-## Inspect and diagnose
+```bash
+python -m experiment.degradation.cli monitor \
+  --prometheus-url http://127.0.0.1:9090 \
+  --state-dir "$HOME/.local/state/rl-insight/degradation/default"
+```
 
-Inspect the latest event and best available phase:
+With no baseline, the same process collects 30 complete new steps, writes the
+baseline after the next-step boundary, and immediately continues detection. With
+an existing baseline, it loads the file and starts detection immediately.
+Correlation and random-forest association run automatically for every confirmed
+and closed target transition.
+
+### Continuous monitoring invariant
+
+- Run `monitor` as a foreground process inside one persistent terminal/session.
+- Keep waiting on and polling that same session until the user explicitly asks
+  to stop. Do not detach, daemonize, replace, or prematurely restart it.
+- Do not return a final answer after startup or baseline completion.
+- When the log reports `Trained <count> baselines from steps <start>-<end>;
+  skipped <count> series`, immediately notify the user with:
+
+  ```text
+  Baseline ready: trained <count> baselines from steps <start>-<end>; skipped <count> series. Monitoring continues in the same process.
+  ```
+
+- That notification is not completion. Continue watching the same process.
+- On every `Confirmed event` and `Closed event`, inspect and report immediately,
+  then resume waiting without another user prompt.
+
+Leave the foreground monitor session untouched. Inspect transitions in a
+separate temporary command session with:
 
 ```bash
 python -m experiment.degradation.cli show \
-  --kind all --event latest --phase auto \
-  --state-dir /absolute/path/to/degradation-state
+  --kind events --event all --phase both \
+  --state-dir "$HOME/.local/state/rl-insight/degradation/default"
 ```
 
-`latest` selects the last stored, most recently confirmed event. `auto` selects
-`closed` when present and otherwise `confirmed`. Use `--event all` or `--phase
-confirmed|closed|both` only when another view is needed. An unavailable explicit
-phase is a command error.
+After reporting, close only the temporary command session and resume polling the
+original monitor session. Never return a final answer after an event report.
 
-Interpret these state statuses:
+Match exactly one stored event using the logged target metric plus transition
+step: `confirmed_at_step` for confirmed and `closed_at_step` for closed. Read only
+the matching phase. If zero or multiple events match, report the ambiguity and
+do not generate a diagnosis.
 
-- `ok`: valid baseline and at least one abnormal event.
-- `no_abnormal_events`: valid baseline and no abnormal event; this is success.
-- `uninitialized`: neither state file exists, including after reset.
-- `invalid_state`: corrupt, unsupported, non-regular, or inconsistent state.
+Generate an anomaly report only for `status=ok` with a selected event. For
+`no_abnormal_events`, report that no event exists. For `uninitialized`, report
+that no baseline exists. For `invalid_state` or command failure, report the
+problem and use [troubleshooting.md](references/troubleshooting.md); do not
+generate a fault hypothesis.
 
-The first three exit with `0`; `invalid_state` exits with `1`. Structured
-`check`, `show`, and `reset` execution or selection failures return `{"ok":
-false, "error": "..."}` on stderr and do not create another state status.
-`run-once` and `monitor` retain the runtime's normal stderr and exit codes.
+### Association output
 
-Generate the diagnostic summary only when `show` returns `status=ok` with at
-least one selected event. For `no_abnormal_events`, report that no abnormal
-event exists. For `uninitialized`, report that no baseline exists. For
-`invalid_state`, read [troubleshooting.md](references/troubleshooting.md) and
-report the state problem. Never generate a fault hypothesis for these statuses
-or for a command failure.
+Use the default `--top-k 25`; do not change it unless the user explicitly asks.
+Render every returned entry in the complete stored Top-25, or every returned
+entry when fewer than 25 are available. Group entries by the English metric
+category, sort categories by their highest association score in descending
+order, and sort metrics within each category by association score in descending
+order. Break score ties by the stored `global_rank`. Category member count is
+not a fault decision.
 
-For a valid selected event, read `top_k_by_category` as grouped presentation of
-the stored flat Top-K.
-Categories follow their best original `global_rank`; metric count is context, not
-a fault decision. Use [diagnostic-experience.md](references/diagnostic-experience.md)
-only as an incomplete, fallible prior. Combine the model's own technical
-knowledge with metric meaning, score, direction, correlation/random-forest
-availability, labels, phase, temporal context, category evidence, and
-contradictions. Category size and experience examples must not decide the result.
+The displayed table must contain only `Metric category`, `Metric name`, and
+`Association score`. Display stored `association_percent` in the
+`Association score` column. Use a compact Markdown table with ordinary pipe and
+hyphen separators.
+Do not add labels, direction, rank, correlation, random-forest fields, or
+commentary inside this table. The complete deterministic event record remains
+saved at
+`<absolute-state-dir>/abnormal_data.json`; the formatted table is presented in
+the conversation and is not a separate persisted file.
 
-For every valid event phase, rank these fault domains:
-
-- `Compute`
-- `Network`
-- `Host CPU`
-- `HBM`
-
-Return the two best-supported, distinct domains in order and three or four
-ranked specific causes from the vocabulary in
-[diagnostic-experience.md](references/diagnostic-experience.md); do not add new
-domain or cause labels.
-The second domain may have `Low` confidence, but do not omit it or assign fake
-numeric probabilities. These are diagnostic hypotheses, not claims that an
-unobserved hardware, network, or operating-system signal was measured.
-
-Start each confirmed or closed transition report with exactly:
+Illustrative format (the live report must include all returned Top-25 entries):
 
 ```text
-Abnormal target metric: <metric and identifying labels>
-Event phase: confirmed|closed
-Most likely fault domain: Compute|Network|Host CPU|HBM (confidence: High|Medium|Low)
-Second likely fault domain: Compute|Network|Host CPU|HBM (confidence: High|Medium|Low)
-Likely fault causes:
-1. <specific cause> — <brief evidence basis>
-2. <specific cause> — <brief evidence basis>
-3. <specific cause> — <brief evidence basis>
-[4. <specific cause> — <brief evidence basis>]
-Reasoning basis: <two or three concise professional sentences>
+Abnormal target metric: rl_insight_monitor_timing_s_step
+Event phase: confirmed
+Saved result: /absolute/path/to/degradation-state/abnormal_data.json
 ```
 
-Then print `Association evidence categories:` followed by each non-empty English
-category block and every metric in the stored Top-25, or every returned entry
-when fewer than 25 are available. Preserve `global_rank` order and include
-identifying labels, association percentage, direction, and rank for every item;
-never shorten the block to a few representative metrics.
-Do not translate category names, metric names, domains, or causes. Treat
-association percentage as relative evidence, not fault probability, causal
+| Metric category | Metric name | Association score |
+|---|---|---:|
+| transfer_queue | tq_partition_consumption_progress | 94.80% |
+| transfer_queue | tq_storage_utilization_ratio | 91.25% |
+| latency | rl_insight_monitor_perf_throughput | 88.60% |
+| hardware_resources | rl_insight_monitor_perf_mfu_actor | 81.40% |
+
+Treat association score as relative evidence, never fault probability, causal
 contribution, or degradation magnitude.
 
-## Reset safely
+For each valid transition, present one complete report in this order: abnormal
+target, event phase, saved JSON path, compact Markdown association table, then
+the root-cause analysis from Section 4.
 
-Stop monitoring and preview the exact targets:
+If `monitor` exits non-zero, immediately report its exit status and stderr. Run
+read-only `check` and local `show`, read
+[troubleshooting.md](references/troubleshooting.md), and provide the likely
+execution cause and next action. Do not reset state, change thresholds, or
+generate an event diagnosis from a failed command.
+
+## 4. Root Cause Analysis
+
+### Input
+
+- The uniquely matched abnormal target and event phase.
+- The complete `top_k_by_category` result, including the underlying labels,
+  direction, global rank, association score, and available correlation/random-
+  forest evidence.
+- Temporal context and confirmed/closed lifecycle information.
+- [diagnostic-experience.md](references/diagnostic-experience.md) as an
+  incomplete, fallible prior.
+
+### Analysis Capabilities
+
+- Interpret metric semantics and temporal coherence across categories.
+- Combine supporting evidence, contradictions, labels, direction, correlation,
+  and random-forest availability.
+- Treat data-characteristic changes as possible workload confounders.
+- Rank fault domains and specific causes without using category count as a vote.
+- Never invent unobserved hardware, network, operating-system, profiler, or
+  device-health signals.
+
+Use these fault domains: `Compute`, `Network`, `Host CPU`, and `HBM`. Always rank
+exactly two distinct domains: primary and secondary. Return three to five
+specific causes in confidence order; item 1 is the primary cause. `Low`
+confidence is allowed, but every cause needs a concise evidence or uncertainty
+basis and must not contradict observed evidence. Use only the cause vocabulary
+in [diagnostic-experience.md](references/diagnostic-experience.md).
+
+Apply this diagnosis contract only when the selected phase contains at least one
+association entry. If it contains none, report the stored association status and
+reason, state that root-cause evidence is insufficient, and do not fabricate
+domains or causes.
+
+### Output
+
+```text
+Primary fault domain: <domain> (confidence: High|Medium|Low)
+Secondary fault domain: <different domain> (confidence: High|Medium|Low) — <brief evidence basis>
+
+Likely fault causes:
+1. <specific cause> (primary; confidence: High|Medium|Low) — <brief evidence basis>
+2. <specific cause> (confidence: High|Medium|Low) — <brief evidence basis>
+3. <specific cause> (confidence: High|Medium|Low) — <brief evidence basis>
+[4. <specific cause> (confidence: High|Medium|Low) — <brief evidence basis>]
+[5. <specific cause> (confidence: High|Medium|Low) — <brief evidence basis>]
+
+Reasoning basis: <two or three concise professional sentences covering the strongest evidence and material contradiction>
+```
+
+### Example
+
+```text
+Primary fault domain: Network (confidence: Medium)
+Secondary fault domain: Compute (confidence: Low) — throughput and MFU degradation also permit compute contention.
+
+Likely fault causes:
+1. Parameter-plane network congestion (primary; confidence: Medium) — communication-sensitive latency and transfer backlog move together.
+2. Parameter-plane NIC bandwidth limitation (confidence: Low) — sustained throughput loss is compatible, but no direct NIC counter is present.
+3. AI Core overload (confidence: Low) — remains possible, but direct Cube utilization evidence is absent.
+
+Reasoning basis: The strongest association evidence is concentrated in transfer-queue and latency metrics while sequence-length evidence is stable. The data supports a network-domain hypothesis, but it cannot directly locate the constrained component.
+```
+
+Use this section only to interpret observed evidence. Do not provide operational
+procedures, commands, configuration changes, parameter values, or steps for
+reproducing faults.
+
+## 5. Reset
+
+Stop monitoring, then preview the exact targets:
 
 ```bash
 python -m experiment.degradation.cli reset \
-  --state-dir /absolute/path/to/degradation-state
+  --state-dir "$HOME/.local/state/rl-insight/degradation/default"
 ```
 
 After explicit user confirmation, back up and remove only those state files:
 
 ```bash
 python -m experiment.degradation.cli reset \
-  --state-dir /absolute/path/to/degradation-state --yes
+  --state-dir "$HOME/.local/state/rl-insight/degradation/default" --yes
 ```
 
 Do not use the legacy `--reset` flag for this workflow: it deletes state and
-immediately retrains. Safe `reset --yes` backs up all existing targets before any
+immediately retrains. Safe `reset --yes` backs up every existing target before
 deletion and leaves the state `uninitialized`.
-
-## Preserve scope
-
-- Preserve KDE fitting, multimodal ranges, the 3-of-5 lifecycle rule, and the
-  correlation/random-forest ranking unless explicitly asked to change them.
-- Keep global step outside target/candidate modeling and raw Histogram/Counter
-  families outside v0.1 KDE.
-- Do not claim multi-task isolation, retry orchestration, daemon management,
-  alert delivery, or Grafana administration.
-- Report the command, selector, state directory, exit status, and material
-  warnings after each operation.

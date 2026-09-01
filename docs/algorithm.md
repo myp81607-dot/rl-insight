@@ -12,16 +12,19 @@ experiment/degradation/
 ├── baseline.py
 ├── detector.py
 ├── association.py
+├── state_schema.py
 ├── storage.py
+├── presentation.py
 ├── runtime.py
 └── cli.py
 ```
 
 公共数据类型放在拥有其语义的模块中，不单独增加 `types.py`。`metrics.py` 保存 metric catalog；
-`config.py` 只构造类型化参数；`storage.py` 负责两个 JSON 的 schema 和文件操作；`runtime.py`
-负责编排；`cli.py` 只解析用户意图并调用 runtime。
+`config.py` 只构造类型化参数；`state_schema.py` 负责纯 schema 校验和状态分类；`storage.py`
+负责两个 JSON 的文件操作；`presentation.py` 负责事件选择和分组展示；`runtime.py` 负责编排；
+`cli.py` 只解析用户意图并调用这些公共能力。
 
-## v0.1 baseline collection
+## Baseline collection
 
 ```text
 启动程序
@@ -46,7 +49,7 @@ experiment/degradation/
 例如，基线使用 step 101～130，则需要观察到 step 131，并查询
 `[timestamp(101), timestamp(131))`。Step 131 只用作结束边界，不进入基线。
 
-## v0.1 window contract
+## Window contract
 
 1. Step 由 `rl_insight_monitor_training_global_step` 的变化时间划分：
    `[timestamp(step k), timestamp(step k+1))`。`timestamp(step k)` 是首次观察到值
@@ -56,7 +59,7 @@ experiment/degradation/
 3. 某个 `SeriesId` 在某个 step 内没有值时，在 `StepFrame` 中保留 `None`，不删除整个
    step。
 4. Window 始终输出目标数量的 `StepFrame`。KDE 的最少有效样本数由 `baseline.py`
-   判断，不属于 window 职责。v0.1 的目标是30个 step，每个 series 至少需20个非空值。
+   判断，不属于 window 职责。当前目标是30个 step，每个 series 至少需20个非空值。
 5. 同 metric name、不同 labels 的时序是不同 `SeriesId`，分别保留和对齐。
 6. Baseline 采集使用普通 `list[StepFrame]`，不使用 queue。
 7. Global step 必须单调、按1递增并覆盖所有必需边界。缺少任意中间 step 或结束边界时直接
@@ -66,7 +69,7 @@ experiment/degradation/
 
 ## Metric value boundary
 
-`metrics.py` 是 v0.1 默认 metric catalog 的唯一来源：
+`metrics.py` 是默认 metric catalog 的唯一来源：
 
 - `GLOBAL_STEP_METRIC` 是 `rl_insight_monitor_training_global_step`，只作为 step 标尺。
 - `TARGET_METRICS` 包含15个可直接输入 KDE 的标量 latency target，统一使用 `Policy.UP`。
@@ -84,7 +87,7 @@ Counter 的既定后续方向仍是由 Prometheus 执行 `rate(counter[window])`
 raw Counter 手工差分。正式接入前还需确定显式 Counter 清单、metadata 兜底、rate window 和
 histogram 排除规则；这些不能只靠 metric 名称猜测。
 
-## v0.1 baseline contract
+## Baseline contract
 
 `baseline.py` 的输入是 `list[StepFrame]`，它不知道 Prometheus、target/candidate 分类或报警方向。
 
@@ -101,11 +104,11 @@ histogram 排除规则；这些不能只靠 metric 名称猜测。
 7. 一个指标可以保留多个独立正常区间。基线结果同时记录原始 KDE 阈值、最终阈值、带宽、
    step 范围和样本数。
 
-v0.1 的默认拟合参数为 `minimum_samples=20`、`alpha=0.025`、
+默认拟合参数为 `minimum_samples=20`、`alpha=0.025`、
 `lower_ratio=upper_ratio=1.05`。这些值集中在类型化参数对象中，并作为函数入参传入；后续
 `config.py` 只负责读取和构造参数，不在算法内部重复写死。
 
-## v0.1 detector contract
+## Detector contract
 
 `detector.py` 接收冻结的 `SeriesBaseline` 和新的 `StepFrame`。它不读取 Prometheus、不训练
 KDE，也不执行 association。
@@ -157,7 +160,7 @@ EventTracker 只接受严格按1递增的 step。重复、倒序或出现 step g
 
 首次获得足够证据时创建 confirmed event；已有事件失去足够证据时关闭。事件的 `end_step`
 和 `end_time` 指向最后一个实际 UP 点，`closed_at_step` 和 `closed_at_time` 表示滑窗首次失去
-证据的判断位置。v0.1 不使用 `duration`、动态 median gap、`n_keep` 或固定的时间边界扩张。
+证据的判断位置。当前实现不使用 `duration`、动态 median gap、`n_keep` 或固定的时间边界扩张。
 
 ### Association boundary
 
@@ -165,7 +168,7 @@ EventTracker 只发出 confirmed/closed 生命周期通知。runtime 在 target 
 时调用一次 association，并在同一事件 closed 后再调用一次。candidate 只需要 point-level
 异常结果，不要求形成正式事件；`detector.py` 不包含相关系数、随机森林或 Top-K 逻辑。
 
-## v0.1 association contract
+## Association contract
 
 `association.py` 是无状态的事件后诊断算法。它接收 runtime 已经截取好的 target
 `PointResult` 窗口、按 `SeriesId` 分组的 candidate `PointResult` 窗口和
@@ -231,13 +234,13 @@ association_score[j]
 candidate 中重复保存；clip 前的负 importance、correlation reason 等只属于内部诊断。
 `skipped_candidates` 仅记录 coverage 不足、对齐点不足或常量序列等未进入排名的原因。
 
-v0.1 association 默认参数为：`correlation_weight=0.85`、`random_forest_weight=0.15`、
+Association 默认参数为：`correlation_weight=0.85`、`random_forest_weight=0.15`、
 `min_aligned_points=10`、`min_rf_samples=30`、`min_coverage_ratio=0.6`、
 `n_estimators=200`、`class_weight="balanced"`、`random_state=42`、
 `train_fraction=0.7`、`permutation_repeats=10` 和 `n_jobs=1`。runtime 后续单独提供
 `pre_context_steps=30` 和 `top_k=25`。
 
-## v0.1 storage contract
+## Storage contract
 
 `JsonStorage` 只拥有 `standard_data.json` 和 `abnormal_data.json` 的路径、schema、JSON
 序列化、反序列化和文件删除。它不知道何时训练、检测、confirm 或 close；runtime 决定这些时机
@@ -245,10 +248,10 @@ v0.1 association 默认参数为：`correlation_weight=0.85`、`random_forest_we
 
 Top-K 截取和 candidate 主要方向属于产品语义，仍由 runtime 计算；storage 只把 runtime 传入的
 `top_associations` 和 `directions` 写入 JSON。`BaselineSnapshot` 是重启检测所需的冻结模型，
-不包含30-step原始训练数据。文件读写、删除和 schema 损坏统一报告为 `StorageError`。v0.1
+不包含30-step原始训练数据。文件读写、删除和 schema 损坏统一报告为 `StorageError`。当前实现
 不增加通用 backend、repository 或数据库抽象。
 
-## v0.1 runtime contract
+## Runtime contract
 
 ### Metric roles and state
 
@@ -285,6 +288,9 @@ standard_data.json 已存在
   → 用启动时观察到的当前 global step 建立新 cursor
 ```
 
+无论加载还是新拟合，baseline 都必须至少保留一个配置 target 和一个配置 candidate；否则
+初始化失败，避免进入无法产生 target event 或 association evidence 的空监控状态。
+
 每轮默认300秒。轮询周期只决定多久查看一次，不决定窗口中有几个 step。若 cursor 为141，而
 本轮看到 current step 145，则145区间尚未结束，只处理141～144，再将 cursor 移到145。
 Prometheus 查询或 step 对齐抛错时不会推进 cursor。
@@ -312,27 +318,39 @@ closed 分析更新同一条记录。candidate 方向定义为 target 实际事�
 
 ### Restart and reset boundary
 
-重启会恢复 frozen baseline，但 v0.1 不恢复 detector 的 recent window、活动事件 context 或运行
+重启会恢复 frozen baseline，但当前实现不恢复 detector 的 recent window、活动事件 context 或运行
 cursor，也不回放停机期间的数据。启动时位于某个 step 中间时，该 step 只会收集启动后的剩余
-部分；已有但尚未 closed 的旧事件记录不会自动续接。这是初版范围限制，不是生产级 checkpoint
+部分；已有但尚未 closed 的旧事件记录不会自动续接。这是当前范围限制，不是生产级 checkpoint
 语义。
 
-`--reset` 由 CLI 表达用户意图；`runtime.reset()` 清空内存状态并调用 `storage.reset()`，后者只
-删除配置指定的 `standard_data.json` 和 `abnormal_data.json`。随后 runtime 重新收集30个 step。
-影响 baseline fitting 的显式参数与已有 JSON 不一致时，必须搭配 `--reset`，不会静默忽略新参数。
+安全 `reset` 子命令先预览目标；明确传入 `--yes` 后，CLI 先备份现有文件，再删除配置指定的
+`standard_data.json` 和 `abnormal_data.json`，并保持 `uninitialized`。兼容用 legacy
+`--reset` 则调用 `runtime.reset()` 后立即重新训练，不属于 Skill 的安全 reset 流程。
 
-## v0.1 CLI
+## CLI
 
-当前能力保持在 experiment 内，不修改根 `rl-insight` 命令：
+当前能力保持在 experiment 内，不修改根 `rl-insight` 命令。Skill 使用以下 canonical
+subcommands：
 
 ```bash
-# 自动训练或加载 baseline，然后每5分钟持续检测
+python -m experiment.degradation.cli check
+python -m experiment.degradation.cli run-once
+python -m experiment.degradation.cli monitor
+python -m experiment.degradation.cli show --event latest --phase auto
+python -m experiment.degradation.cli reset
+python -m experiment.degradation.cli reset --yes
+```
+
+原有 flat flags 只为兼容已有调用方而保留：
+
+```bash
+# 自动训练或加载 baseline，然后持续检测
 python -m experiment.degradation.cli
 
 # 初始化并只执行一轮检测
 python -m experiment.degradation.cli --once
 
-# 清空两个 JSON，并用新 ratio 重新训练
+# 立即清空两个 JSON 并重新训练；不是 Skill 的安全 reset
 python -m experiment.degradation.cli --reset --baseline-ratio 1.6
 
 # 查看异常中保存的 correlation/RF 分量
@@ -345,6 +363,6 @@ python -m experiment.degradation.cli --show-components
 
 可重复使用 `--target-metric` 添加 target；`--state-dir` 控制两个固定文件的位置；
 `--poll-interval`、`--query-step`、`--baseline-steps`、`--pre-context-steps` 和 `--top-k` 均为显式
-入参。v0.1 的 instant global-step 查询仍使用裸 metric name，因此仍依赖“当前只有一个训练任务、
+入参。当前 instant global-step 查询仍使用裸 metric name，因此仍依赖“当前只有一个训练任务、
 `rl_insight_monitor_training_global_step` 只有一条有效 series”的冻结假设；`--series-selector`
 只约束 series 发现和 range query。

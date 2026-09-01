@@ -3,13 +3,14 @@
 Use the core CLI's read-only `check` before `run-once` or `monitor`, or when
 troubleshooting Prometheus/readiness. It reports the selected global step,
 discovered metric counts, optional dependencies, and state-file health. Do not
-require it before offline `show` or `reset`.
+require it before local `show` or `reset`.
 
 ## Prometheus request fails
 
-- The first attempt uses `http://127.0.0.1:9090`. If it is unreachable, ask the
-  user whether the Prometheus URL and state directory should be changed. Do not
-  guess another endpoint, state path, or task selector.
+- The first attempt uses `http://127.0.0.1:9090` and the absolute expansion of
+  `~/.local/state/rl-insight/degradation/default`. If either is unavailable, ask
+  whether the Prometheus URL and state directory should be changed. Do not guess
+  another endpoint, state path, or task selector.
 - Confirm the URL points to Prometheus itself, commonly port 9090, rather than a
   training service or model endpoint.
 - Test the Prometheus readiness endpoint and API reachability from the same host
@@ -21,9 +22,9 @@ require it before offline `show` or `reset`.
 
 - Confirm that `rl_insight_monitor_training_global_step` is being scraped.
 - Narrow the training task at the Prometheus/job configuration level when
-  multiple global-step series exist. The v0.1 instant query uses the metric name
-  directly and requires uniqueness; `--series-selector` does not filter that
-  instant query.
+  multiple global-step series exist. The current instant query uses the metric
+  name directly and requires uniqueness; `--series-selector` does not filter
+  that instant query.
 - Do not select an arbitrary series or merge steps from different tasks.
 
 ## No target metric is discovered
@@ -54,20 +55,21 @@ require it before offline `show` or `reset`.
   boundary, and then continues detection in the same process.
 - Association runs automatically at confirmed and closed transitions. Keep the
   monitoring task active so the agent can inspect and report each transition.
+- Run event `show` in a separate temporary command session. Never interrupt or
+  replace the foreground monitor session to inspect persisted state.
 
 ## Monitor exits non-zero
 
 - Preserve and report the original exit status and stderr before running any
   diagnostic command.
-- Run read-only `check` and offline `show` independently. If either diagnostic
+- Run read-only `check` and local `show` independently. If either diagnostic
   also fails, report that failure without replacing the original monitor error.
 - Use the relevant section below to explain the likely cause and next action.
 - Automatically correct only an equivalent working directory, known existing
   virtual environment, absolute state path, or command syntax that does not
   change values. Retry the same read-only diagnostic at most once.
-- For an explicit timeout, connection reset, or HTTP 5xx only, confirm the old
-  monitor exited and no duplicate uses the state directory, then retry monitor
-  once with identical arguments. Never loop.
+- Do not automatically restart monitoring after any failure. Explain the cause
+  and next action, then wait for user direction.
 - Ask before installing dependencies, changing URL/selector/metrics/thresholds,
   using `--insecure`, resetting or editing state, killing a live process, editing
   code, or starting another monitor. Do not generate an event fault hypothesis.

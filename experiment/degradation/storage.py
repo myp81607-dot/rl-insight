@@ -285,7 +285,7 @@ def _association_to_json(
 
 
 class JsonStorage:
-    """Own the two JSON files used by the v0.1 runtime."""
+    """Own the two JSON files used by the degradation runtime."""
 
     def __init__(self, standard_data_path: Path, abnormal_data_path: Path) -> None:
         self.standard_data_path = Path(standard_data_path)

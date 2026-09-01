@@ -45,7 +45,7 @@ LOGGER = logging.getLogger(__name__)
 
 
 class DegradationRuntimeError(RuntimeError):
-    """The v0.1 runtime cannot continue with its current state."""
+    """The degradation runtime cannot continue with its current state."""
 
 
 @dataclass(frozen=True)
@@ -111,7 +111,7 @@ def _association_directions(
 
 
 class DegradationRuntime:
-    """A synchronous v0.1 degradation workflow."""
+    """A synchronous degradation workflow."""
 
     def __init__(
         self,
@@ -245,6 +245,17 @@ class DegradationRuntime:
         target_identities = [
             identity for identity, policy in policies.items() if policy is Policy.UP
         ]
+        candidate_identities = [
+            identity for identity, policy in policies.items() if policy is Policy.BOTH
+        ]
+        if not target_identities:
+            raise DegradationRuntimeError(
+                "none of the configured target metrics produced a baseline"
+            )
+        if not candidate_identities:
+            raise DegradationRuntimeError(
+                "none of the configured candidate metrics produced a baseline"
+            )
         self.baselines = selected
         self.policies = policies
         self.target_trackers = {

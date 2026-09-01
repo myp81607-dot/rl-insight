@@ -1,8 +1,9 @@
 # Diagnostic experience
 
-These priors summarize failure mechanisms represented by controlled test
-scenarios. They are not fault-injection instructions and do not assert direct
-observation of signals absent from the association evidence.
+These diagnostic priors help interpret observed association evidence. They do
+not assert direct observation of signals absent from that evidence. Do not use
+this reference to provide operational procedures, commands, configuration
+changes, parameter values, or steps for reproducing faults.
 
 The evidence categories (`latency`, `training_quality`, `rollout_quality`,
 `data_characteristics`, `hardware_resources`, `vllm_engine`, and
@@ -21,9 +22,8 @@ as `training_epoch` and `tq_controller_uptime_seconds` require corroboration.
   is normal and frequency must not be claimed unless directly observed.
 - `NPU core offline`: the experiment label for abrupt, severe, persistent loss
   of effective NPU compute capacity. It may represent localized capacity being
-  unavailable or fully occupied; do not translate this label into a claim of
-  physical core disappearance, ECC/RAS failure, or device removal without a
-  direct signal.
+  unavailable; do not translate this label into a claim of physical core
+  disappearance, ECC/RAS failure, or device removal without a direct signal.
 - `AI Core overload`: contention concentrated in Cube/matrix compute. Direct
   AIC/Cube utilization or profiler evidence distinguishes it best; otherwise a
   compute-heavy target slowdown with stable sequence length is only indirect
@@ -38,13 +38,12 @@ compute evidence; the event is a brief stall followed by rapid recovery.
 
 ### Network
 
-- `Endpoint NIC bandwidth constraint`: sustained parameter-plane communication
-  capacity limitation at an endpoint.
-- `Switch-port egress bandwidth constraint`: sustained limitation on the
-  egress path of a switch port.
-- `Interface QoS/CAR-induced restriction`: policy-driven sustained or bursty
-  capacity restriction; policing may drop or remark excess traffic, while
-  shaping may buffer it.
+- `Parameter-plane NIC bandwidth limitation`: sustained communication-capacity
+  limitation associated with an endpoint network path.
+- `Parameter-plane switch-port egress bandwidth limitation`: sustained
+  communication-capacity limitation associated with an egress path.
+- `Parameter-plane network congestion`: sustained or bursty contention within
+  the communication path.
 - `Transient parameter-plane link interruption`: abrupt communication stall,
   often followed by recovery or a closed event, consistent with a temporary
   link interruption.
@@ -58,8 +57,8 @@ restriction. Abrupt stall and rapid recovery weakly favor transient interruption
 
 Evidence that weakens Network: only rollout generation or vLLM metrics degrade;
 data length grows coherently; or no communication-related timing/throughput
-effect is present. Do not claim observed packet loss, CAR, NIC rate limiting, or
-link down without direct counters or logs.
+effect is present. Do not claim observed packet loss, rate limitation, or link
+down without direct counters or logs.
 
 ### Host CPU
 
@@ -81,9 +80,9 @@ communication effects, or sequence-length growth fully explains the event.
 
 ### HBM
 
-- `HBM congestion`: periodic or progressively stronger contention for NPU HBM
-  capacity or memory bandwidth, causing compute and rollout work to wait. This
-  label does not imply continuous saturation or defective memory.
+- `HBM congestion`: contention for NPU HBM capacity or memory bandwidth that
+  causes compute and rollout work to wait. This label does not imply continuous
+  saturation or defective memory.
 
 Prefer HBM when NPU memory allocation/resource evidence, latency, and throughput
 degradation are temporally coherent, especially when the severity varies over
@@ -104,10 +103,11 @@ stall, or a data-length increase that explains the memory and latency changes.
 3. Treat data-characteristic changes as workload confounders before attributing
    latency to infrastructure. Treat training/rollout quality as downstream
    effects unless their semantics directly support a cause.
-4. Rank two distinct domains and three or four specific causes. Causes should
-   normally come from the two ranked domains. If evidence is weak, use `Low`
-   confidence and state the missing discriminator, but still make an ordered
-   best judgment.
+4. Rank exactly two distinct fault domains and three to five specific causes;
+   cause 1 is primary. `Low` confidence is allowed, but every item needs an
+   evidence or uncertainty basis and must not contradict observed evidence. If
+   the selected phase has no association entries, report insufficient root-cause
+   evidence instead of fabricating this ranking.
 5. Keep the reasoning concise and professional. Do not invent profiler, network,
    frequency, CPU, HBM, ECC/RAS, or device-health observations.
 
@@ -121,8 +121,6 @@ stall, or a data-length increase that explains the memory and latency changes.
   documents memory-access and bandwidth analysis.
 - [HCCL alpha-beta model](https://www.hiascend.com/document/detail/en/canncommercial/850/commlib/hcclug/hcclug_000115.html)
   relates communication time to latency and per-byte transfer cost.
-- [Huawei traffic policing and shaping](https://info.support.huawei.com/enterprise/en/doc/EDOC1100419255/13e69fa0/traffic-policing-and-traffic-shaping-configuration)
-  distinguishes CAR policing from buffered shaping.
 - [Linux CPU hotplug](https://docs.kernel.org/core-api/cpu_hotplug.html),
   [CPUFreq](https://docs.kernel.org/admin-guide/pm/cpufreq.html), and
   [Pressure Stall Information](https://docs.kernel.org/accounting/psi.html)

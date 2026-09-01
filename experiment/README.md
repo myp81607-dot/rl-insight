@@ -5,7 +5,7 @@ Prometheus. It can train or load a KDE baseline, monitor newly completed trainin
 steps, confirm target degradation, rank associated metrics, and persist the results
 as JSON.
 
-The current implementation is a source-tree v0.1 experiment. It assumes one active
+The current implementation is a source-tree experiment. It assumes one active
 training task and one unique `rl_insight_monitor_training_global_step` series.
 
 ## Workflow
@@ -80,14 +80,14 @@ it loads it and begins detection immediately:
 ```bash
 python -m experiment.degradation.cli monitor \
   --prometheus-url http://127.0.0.1:9090 \
-  --state-dir /absolute/path/to/degradation-state
+  --state-dir "$HOME/.local/state/rl-insight/degradation/default"
 ```
 
 Do not use `run-once` to bootstrap continuous monitoring. `monitor` performs
 baseline initialization and remains running until stopped. The CLI is a
 foreground process; an agent that must keep responding while it runs should keep
 it attached to one persistent terminal/session rather than starting a second
-command after baseline training.
+replacement monitor process after baseline training.
 
 After starting `monitor`, the agent should keep the task active and continue
 waiting on the same terminal/session until the user explicitly asks to stop. It
@@ -105,32 +105,33 @@ guess a trainer/job label. The global-step instant query must still return
 exactly one series.
 
 An agent should first use the default Prometheus URL
-`http://127.0.0.1:9090` and reuse the established absolute state directory for
-the task. If that URL is unreachable or the state directory cannot be
-established, it should ask whether the Prometheus URL and state directory need
-to be changed instead of guessing an alternate URL, path, or label selector.
+`http://127.0.0.1:9090` and the absolute expansion of
+`~/.local/state/rl-insight/degradation/default`. If either is unavailable, it
+should ask whether the Prometheus URL and state directory need to be changed
+instead of guessing an alternate URL, path, or label selector. Another training
+task requires a separate state directory.
 
 Common operations:
 
 ```bash
 # Read-only Prometheus, dependency, metric, and state preflight.
 python -m experiment.degradation.cli check \
-  --state-dir /absolute/path/to/degradation-state
+  --state-dir "$HOME/.local/state/rl-insight/degradation/default"
 
 # Initialize and perform only one detection poll.
 python -m experiment.degradation.cli run-once \
-  --state-dir /absolute/path/to/degradation-state
+  --state-dir "$HOME/.local/state/rl-insight/degradation/default"
 
 # Validate state and show category-grouped evidence.
 python -m experiment.degradation.cli show \
   --event latest --phase auto \
-  --state-dir /absolute/path/to/degradation-state
+  --state-dir "$HOME/.local/state/rl-insight/degradation/default"
 
 # Preview, then explicitly confirm a backup-first reset.
 python -m experiment.degradation.cli reset \
-  --state-dir /absolute/path/to/degradation-state
+  --state-dir "$HOME/.local/state/rl-insight/degradation/default"
 python -m experiment.degradation.cli reset \
-  --state-dir /absolute/path/to/degradation-state --yes
+  --state-dir "$HOME/.local/state/rl-insight/degradation/default" --yes
 ```
 
 Run `check` before `run-once` or `monitor`. It requires at least one configured
@@ -141,21 +142,35 @@ and remain usable when Prometheus is unavailable. Do not start `run-once` or
 `monitor` until the selector, metric export, or Prometheus data exposes a
 configured candidate.
 
+Baseline fitting must retain at least one configured target and one configured
+candidate. Otherwise initialization exits instead of starting a monitor that
+cannot produce target events or association evidence.
+
 Correlation and random-forest association are always active. Runtime analyzes
 and persists evidence at both confirmed and closed transitions. An agent watching
-the monitor should immediately inspect `show --event all --phase both` and report
-exactly one event matched by target metric plus `confirmed_at_step` or
-`closed_at_step`. Confirmed and closed are separate reports for each target
-transition, not reports for each associated candidate metric.
+the monitor should leave its session untouched, run `show --event all --phase
+both` in a separate temporary command session, and report exactly one event
+matched by target metric plus `confirmed_at_step` or `closed_at_step`. It then
+closes only the temporary session and resumes polling the original monitor.
+Confirmed and closed are separate reports for each target transition, not
+reports for each associated candidate metric. An event report is not a final
+answer.
 
-For a valid unique event, the agent ranks two distinct fault domains from
-`Compute`, `Network`, `Host CPU`, and `HBM`, assigns `High`, `Medium`, or `Low`
-confidence, and lists three or four ordered specific causes. It then prints all
-metrics in every non-empty `top_k_by_category` block, preserving the complete
-stored Top-25 (or every returned entry when fewer than 25 are available),
-`global_rank`, association percentage, direction, and identifying labels. It
-must not reduce the evidence to representative metrics or treat association
-percentage as fault probability.
+For a valid unique event with association evidence, the agent ranks exactly two
+distinct fault domains from `Compute`, `Network`, `Host CPU`, and `HBM`, then
+returns three to five specific causes in confidence order. Cause 1 is primary;
+every cause needs an evidence or uncertainty basis and must not contradict the
+observed evidence. A selected phase with no association entries reports
+insufficient root-cause evidence instead of fabricating a ranking.
+
+The complete stored Top-25 (or every returned entry when fewer than 25 are
+available) is rendered as a compact Markdown table. Categories are ordered by
+their highest association score, and metrics within each category are ordered by
+score; score ties retain stored global-rank order. The displayed table contains
+only the metric category, metric name, and association score. The underlying
+JSON retains labels, direction, rank, correlation, and random-forest fields for
+analysis. Association percentage is not fault probability. Agents use the
+default `--top-k 25` unless the user explicitly requests another value.
 
 Diagnostic experience is an incomplete, fallible prior. The agent must combine
 its own technical knowledge with metric semantics, scores, direction, labels,
@@ -166,12 +181,10 @@ observed facts. When event matching is not unique, report ambiguity and do not
 diagnose.
 
 If monitoring exits non-zero, preserve and report the original status and stderr,
-then run read-only `check` and offline `show` independently. Report the likely
-cause and next action. An agent may automatically correct only equivalent local
-execution details and retry a read-only command once. A transient Prometheus
-failure may restart monitor once with identical arguments after the old process
-exits. Other dependency, configuration, state, code, or process changes require
-approval; detailed boundaries live in the Skill troubleshooting reference.
+then run read-only `check` and local `show` independently. Report the likely
+execution cause and next action. Do not automatically reset state, change
+thresholds, or restart monitoring; detailed boundaries live in the Skill
+troubleshooting reference.
 
 The source-tree CLI still accepts the original flat flags for compatibility:
 `--once` runs one poll, `--show-components` prints raw `abnormal_data.json`, and
@@ -191,7 +204,7 @@ Important CLI options:
 | `--pre-context-steps` | Steps retained before an event for association. | `30` |
 | `--top-k` | Associated metrics saved for each event phase. | `25` |
 | `--target-metric` | Adds another UP-policy target; repeat as needed. | catalog targets |
-| `--state-dir` | Directory containing the two JSON state files. | current directory |
+| `--state-dir` | Directory containing the two JSON state files. | current directory for the core CLI; Skill passes the explicit path above |
 | legacy `--reset` | Clears state and immediately retrains. | disabled |
 | legacy `--once` | Runs one poll instead of continuous monitoring. | disabled |
 | legacy `--show-components` | Prints raw `abnormal_data.json`. | disabled |
@@ -206,8 +219,10 @@ when available and otherwise `confirmed`. `--event latest|all` and `--phase
 auto|confirmed|closed|both` provide explicit alternatives.
 
 The CLI groups the stored flat Top-K under `top_k_by_category` without changing
-either JSON file. Categories follow their best original global rank; metric count
-is context, not a mechanical fault decision. `show` reports `ok`,
+either JSON file. The agent renders the grouped result as a score-descending,
+compact Markdown table containing only category, metric name, and association
+score; metric count is context, not a mechanical fault decision. `show` reports
+`ok`,
 `no_abnormal_events`, `uninitialized`, or `invalid_state`. The first three exit
 with `0`; `invalid_state` exits with `1`. Selection and execution failures return
 a separate error response for structured `check`, `show`, and `reset` commands
@@ -224,15 +239,18 @@ is `uninitialized`. Legacy `--reset` does not provide this flow.
 
 ## Output Files
 
-- `standard_data.json` stores fitted normal ranges and baseline parameters. It does
-  not store the original 30-step observations.
-- `abnormal_data.json` stores confirmed and closed events, target direction, Top-K
-  candidate direction, association percentage, correlation values, and
-  random-forest components.
+- `<state-dir>/standard_data.json` stores fitted normal ranges and baseline
+  parameters. It does not store the original 30-step observations.
+- `<state-dir>/abnormal_data.json` stores confirmed and closed events, target
+  direction, Top-K candidate direction, association percentage, correlation
+  values, and random-forest components.
+
+The compact Markdown association table and root-cause narrative are conversation
+output; the CLI does not persist a separate formatted report file.
 
 Metric names that are not exposed by the current training task are skipped. Raw
 Histogram targets and raw Counter candidates remain catalog entries but are not
-sent directly to KDE in v0.1.
+sent directly to the current KDE pipeline.
 
 Detected degradation is stored as an event. Runtime failures are written to stderr,
 and the CLI exits with status `1`.
@@ -264,7 +282,7 @@ python -m ruff format --check experiment/degradation tests/monitor/ut/degradatio
 python -m mypy experiment/degradation
 ```
 
-## v0.1 Scope
+## Scope
 
 - Baselines survive restart; active detector windows, event context, and polling
   cursors do not.

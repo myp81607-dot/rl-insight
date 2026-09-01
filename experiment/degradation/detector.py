@@ -286,7 +286,7 @@ class EventTracker:
         if point.identity != self.identity:
             raise DetectorError("point identity does not match event tracker")
         if point.policy is not Policy.UP:
-            raise DetectorError("v0.1 target event tracking requires policy UP")
+            raise DetectorError("target event tracking requires policy UP")
         if self._last_step is not None and point.step != self._last_step + 1:
             raise DetectorError(
                 f"target steps must be consecutive: expected {self._last_step + 1}, "
