@@ -72,8 +72,13 @@ experiment/degradation/
 `metrics.py` 是默认 metric catalog 的唯一来源：
 
 - `GLOBAL_STEP_METRIC` 是 `rl_insight_monitor_training_global_step`，只作为 step 标尺。
-- `TARGET_METRICS` 包含15个可直接输入 KDE 的标量 latency target，统一使用 `Policy.UP`。
-- `CANDIDATE_METRICS` 包含95个可直接输入 KDE 的标量 candidate，统一使用 `Policy.BOTH`。
+- `TARGET_METRICS` 固定只包含8个可触发事件的标量 `timing_s_*` stage latency target，统一使用
+  `Policy.UP`：`step`、`gen`、`ref`、`adv`、`old_log_prob`、`update_actor`、
+  `update_weights` 和 `testing`。
+- `CANDIDATE_METRICS` 包含102个可直接输入 KDE 的标量 candidate，统一使用 `Policy.BOTH`。
+  其中4个 per-token timing 与 `perf_time_per_step` 归入 `latency`，两个
+  `tq_storage_request_latency_p50/p99` 归入 `transfer_queue`；除非调用者显式使用
+  `--target-metric`，这些 candidate 不会触发事件。
   `CANDIDATE_METRICS_BY_CATEGORY` 仅提供 `latency`、`training_quality`、
   `rollout_quality`、`data_characteristics`、`hardware_resources`、`vllm_engine`
   和 `transfer_queue` 七类静态展示元数据，不参与检测、打分或排序。

@@ -63,6 +63,12 @@ and candidate. Never narrow discovery to trainer, job, or another guessed label
 set. Use a narrower selector only when the user explicitly supplies or requests
 one.
 
+Keep the default event-target set fixed to the eight `timing_s_*` metrics listed
+in [algorithm-contract.md](references/algorithm-contract.md). Per-token timing,
+`perf_time_per_step`, and transfer-queue request latency are candidate evidence,
+not default targets. Do not pass `--target-metric` unless the user explicitly
+requests an additional event target.
+
 Use `run-once` only when the user explicitly requests one initialization and
 detection poll:
 

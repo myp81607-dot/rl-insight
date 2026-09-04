@@ -18,7 +18,7 @@ from dataclasses import dataclass
 
 GLOBAL_STEP_METRIC = "rl_insight_monitor_training_global_step"
 
-# Scalar latency metrics that can be modeled directly with an UP policy.
+# Fixed scalar latency targets that can trigger degradation events.
 TARGET_METRICS = (
     "rl_insight_monitor_timing_s_step",
     "rl_insight_monitor_timing_s_gen",
@@ -28,13 +28,6 @@ TARGET_METRICS = (
     "rl_insight_monitor_timing_s_update_actor",
     "rl_insight_monitor_timing_s_update_weights",
     "rl_insight_monitor_timing_s_testing",
-    "rl_insight_monitor_timing_per_token_ms_gen",
-    "rl_insight_monitor_timing_per_token_ms_ref",
-    "rl_insight_monitor_timing_per_token_ms_adv",
-    "rl_insight_monitor_timing_per_token_ms_update_actor",
-    "rl_insight_monitor_perf_time_per_step",
-    "tq_storage_request_latency_p50",
-    "tq_storage_request_latency_p99",
 )
 
 # Histogram families are cataloged but require aggregation before modeling.
@@ -70,6 +63,11 @@ CANDIDATE_CATEGORIES = (
 # Keep this in runtime order. Every derived candidate view comes from this one
 # catalog, so detection and model-facing presentation cannot drift apart.
 CANDIDATE_METRIC_SPECS = (
+    MetricSpec("rl_insight_monitor_timing_per_token_ms_gen", "latency"),
+    MetricSpec("rl_insight_monitor_timing_per_token_ms_ref", "latency"),
+    MetricSpec("rl_insight_monitor_timing_per_token_ms_adv", "latency"),
+    MetricSpec("rl_insight_monitor_timing_per_token_ms_update_actor", "latency"),
+    MetricSpec("rl_insight_monitor_perf_time_per_step", "latency"),
     MetricSpec("rl_insight_monitor_perf_throughput", "latency"),
     MetricSpec("rl_insight_monitor_perf_mfu_actor", "hardware_resources"),
     MetricSpec("rl_insight_monitor_perf_total_num_tokens", "data_characteristics"),
@@ -202,6 +200,8 @@ CANDIDATE_METRIC_SPECS = (
     MetricSpec("vllm:num_requests_running", "vllm_engine"),
     MetricSpec("vllm:num_requests_waiting", "vllm_engine"),
     MetricSpec("vllm:num_requests_swapped", "vllm_engine"),
+    MetricSpec("tq_storage_request_latency_p50", "transfer_queue"),
+    MetricSpec("tq_storage_request_latency_p99", "transfer_queue"),
     MetricSpec("tq_controller_uptime_seconds", "transfer_queue"),
     MetricSpec("tq_controller_memory_rss_bytes", "transfer_queue"),
     MetricSpec("tq_partition_production_progress", "transfer_queue"),

@@ -35,8 +35,15 @@ Prometheus series
 - Keep series with different label sets separate even when their metric names
   match.
 - Skip catalog metrics that the selected training task does not expose.
-- Model 15 scalar latency targets with an `UP` policy and 95 scalar candidates
-  with a `BOTH` policy.
+- Model exactly these eight scalar event targets with an `UP` policy:
+  `timing_s_step`, `timing_s_gen`, `timing_s_ref`, `timing_s_adv`,
+  `timing_s_old_log_prob`, `timing_s_update_actor`,
+  `timing_s_update_weights`, and `timing_s_testing`, each with the
+  `rl_insight_monitor_` prefix.
+- Model 102 scalar candidates with a `BOTH` policy. Per-token timing and
+  `perf_time_per_step` belong to `latency`; transfer-queue request p50/p99
+  latency belongs to `transfer_queue`. None of these candidates can trigger an
+  event unless the user explicitly promotes one with `--target-metric`.
 - Keep cataloged raw Histogram targets and Counter candidates out of the current
   KDE pipeline.
   Aggregate Histograms and use Prometheus `rate()` or `increase()` for Counters

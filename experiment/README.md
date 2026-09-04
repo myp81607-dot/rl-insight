@@ -104,6 +104,13 @@ and candidate catalogs. Supply a narrower selector only intentionally; do not
 guess a trainer/job label. The global-step instant query must still return
 exactly one series.
 
+The default event-target set is fixed to the eight `rl_insight_monitor_timing_s_*`
+stage metrics defined in `metrics.py`. Per-token timing,
+`rl_insight_monitor_perf_time_per_step`, and transfer-queue request p50/p99
+latency are candidates, so they contribute association evidence without
+triggering confirmed/closed events. `--target-metric` is an explicit opt-in for
+adding another event target and is not used by the Skill by default.
+
 An agent should first use the default Prometheus URL
 `http://127.0.0.1:9090` and the absolute expansion of
 `~/.local/state/rl-insight/degradation/default`. If either is unavailable, it
