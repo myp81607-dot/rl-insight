@@ -12,7 +12,25 @@ domain by category size alone. `association_percent` is temporal association
 strength, not fault probability or causal contribution. Time-trend metrics such
 as `training_epoch` and `tq_controller_uptime_seconds` require corroboration.
 
+Use only the final `association_percent`, metric name, category, rank, target,
+and event phase when applying these priors. Do not inspect raw samples, calculate
+new statistics, compare before/after values, or infer whether a metric increased
+or decreased. Several semantically consistent high-scoring metrics are useful
+joint evidence; a category containing many weakly scored metrics is not.
+
 ## Diagnostic vocabulary
+
+### Workload/data condition
+
+- `Sequence-length anomaly`: consider this when several prompt-length,
+  response-length, global-sequence-length, or total-token metrics are both
+  high-ranking and high-scoring within `data_characteristics`. This is a
+  workload/data explanation rather than an infrastructure fault domain. Do not
+  claim that lengths increased, decreased, or changed by a particular amount;
+  the association result alone does not establish direction or magnitude.
+
+Strong sequence-length association weakens an infrastructure-only explanation.
+One isolated length metric, or many low-scoring length metrics, is insufficient.
 
 ### Compute
 
@@ -26,15 +44,15 @@ as `training_epoch` and `tq_controller_uptime_seconds` require corroboration.
   disappearance, ECC/RAS failure, or device removal without a direct signal.
 - `AI Core overload`: contention concentrated in Cube/matrix compute. Direct
   AIC/Cube utilization or profiler evidence distinguishes it best; otherwise a
-  compute-heavy target slowdown with stable sequence length is only indirect
-  support.
+  compute-sensitive target with strong MFU/throughput association and weak
+  length/sequence association is only indirect support.
 - `AI Vector overload`: contention concentrated in Vector compute. Direct
   AIV/Vector utilization or profiler evidence distinguishes it best. The
   current catalog alone may not reliably separate it from AI Core overload.
 
-Evidence that weakens Compute: prompt, response, or global sequence length grows
-with the latency; vLLM waiting or transfer backlog dominates without coherent
-compute evidence; the event is a brief stall followed by rapid recovery.
+Evidence that weakens Compute: high-scoring length/sequence metrics, or stronger
+vLLM/transfer-queue association without comparably strong compute-related
+metrics.
 
 ### Network
 
@@ -48,17 +66,17 @@ compute evidence; the event is a brief stall followed by rapid recovery.
   often followed by recovery or a closed event, consistent with a temporary
   link interruption.
 
-Prefer Network when communication-heavy timing rises while throughput or MFU
-falls and sequence-length features remain stable. Transfer-queue backlog is
-propagation evidence, not proof of a parameter-plane fault. With the current
-catalog, the first three sustained restrictions are usually observationally
-equivalent; rank them as possible causes without pretending to locate the
-restriction. Abrupt stall and rapid recovery weakly favor transient interruption.
+Prefer Network when communication-sensitive timing and transfer-queue metrics
+receive strong association scores while length/sequence metrics do not. Strong
+transfer-queue association is propagation evidence, not proof of a
+parameter-plane fault. With the current catalog, the first three sustained
+restrictions are usually observationally equivalent; rank them as possible
+causes without pretending to locate the restriction.
 
-Evidence that weakens Network: only rollout generation or vLLM metrics degrade;
-data length grows coherently; or no communication-related timing/throughput
-effect is present. Do not claim observed packet loss, rate limitation, or link
-down without direct counters or logs.
+Evidence that weakens Network: association scores are concentrated in rollout,
+vLLM, or length/sequence metrics and communication-related metrics rank weakly.
+Do not claim observed packet loss, rate limitation, or link down without direct
+counters or logs.
 
 ### Host CPU
 
@@ -69,14 +87,14 @@ down without direct counters or logs.
 - `Host CPU frequency throttling`: broad host-side work slows because effective
   CPU frequency is reduced.
 
-Prefer Host CPU when CPU memory/resource evidence and host-sensitive latency or
-queueing move together while NPU-oriented throughput effects appear secondary.
+Prefer Host CPU when CPU resource and host-sensitive latency/queueing metrics
+receive strong association scores while NPU-oriented evidence ranks lower.
 Direct CPU online-state, utilization/pressure, and frequency counters are needed
 to distinguish the three causes reliably. The current catalog does not justify
 claiming that a CPU was actually offlined, saturated, or frequency-limited.
 
-Evidence that weakens Host CPU: isolated NPU compute evidence, isolated network
-communication effects, or sequence-length growth fully explains the event.
+Evidence that weakens Host CPU: stronger NPU, network, or sequence-length
+association without comparably strong host-sensitive metrics.
 
 ### HBM
 
@@ -84,25 +102,25 @@ communication effects, or sequence-length growth fully explains the event.
   causes compute and rollout work to wait. This label does not imply continuous
   saturation or defective memory.
 
-Prefer HBM when NPU memory allocation/resource evidence, latency, and throughput
-degradation are temporally coherent, especially when the severity varies over
-time while sequence length remains stable. Allocated or reserved memory alone
-does not measure bandwidth congestion. Direct HBM bandwidth/pressure evidence
-is required for a high-confidence subtype claim.
+Prefer HBM when NPU memory resource, latency, and throughput metrics all receive
+strong association scores while length/sequence metrics do not. Allocated or
+reserved memory alone does not measure bandwidth congestion. Direct HBM
+bandwidth/pressure evidence is required for a high-confidence subtype claim.
 
-Evidence that weakens HBM: stable memory evidence, a purely communication-shaped
-stall, or a data-length increase that explains the memory and latency changes.
+Evidence that weakens HBM: memory metrics rank weakly while communication or
+length/sequence metrics dominate the association scores.
 
 ## Synthesis rules
 
 1. Match the exact target event and phase before diagnosing. Confirmed and
    closed transitions receive separate reports.
-2. Read all metrics in the grouped Top-25. Use direction, labels, temporal
-   coherence, metric meaning, global rank, and contradictions; do not count
-   category members as votes.
-3. Treat data-characteristic changes as workload confounders before attributing
-   latency to infrastructure. Treat training/rollout quality as downstream
-   effects unless their semantics directly support a cause.
+2. Read all metrics in the grouped Top-25. Use metric meaning, category, global
+   rank, and final association score only. Do not use raw values, direction,
+   labels, component scores, or independently calculated trends.
+3. Treat a coherent cluster of high-scoring length/sequence metrics as evidence
+   for `Sequence-length anomaly` before attributing latency only to
+   infrastructure. Treat training/rollout quality as downstream evidence unless
+   its metric semantics directly support a cause.
 4. Rank exactly two distinct fault domains and three to five specific causes;
    cause 1 is primary. `Low` confidence is allowed, but every item needs an
    evidence or uncertainty basis and must not contradict observed evidence. If

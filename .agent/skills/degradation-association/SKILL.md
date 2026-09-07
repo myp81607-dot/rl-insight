@@ -197,19 +197,22 @@ generate an event diagnosis from a failed command.
 ### Input
 
 - The uniquely matched abnormal target and event phase.
-- The complete `top_k_by_category` result, including the underlying labels,
-  direction, global rank, association score, and available correlation/random-
-  forest evidence.
-- Temporal context and confirmed/closed lifecycle information.
+- The complete `top_k_by_category` result: metric category, metric name, global
+  rank, and final `association_percent`.
 - [diagnostic-experience.md](references/diagnostic-experience.md) as an
   incomplete, fallible prior.
 
 ### Analysis Capabilities
 
-- Interpret metric semantics and temporal coherence across categories.
-- Combine supporting evidence, contradictions, labels, direction, correlation,
-  and random-forest availability.
-- Treat data-characteristic changes as possible workload confounders.
+- Interpret metric semantics and the concentration of high association scores
+  across categories.
+- Use only the returned final association scores for evidence strength. Do not
+  reopen raw series, query extra samples, write an additional analysis script,
+  compare step values, or independently infer increases, decreases, trends, or
+  change magnitude.
+- When several high-ranking, high-scoring length or sequence metrics appear in
+  `data_characteristics`, consider `Sequence-length anomaly` as a likely cause.
+  A large category with weak scores is not equivalent evidence.
 - Rank fault domains and specific causes without using category count as a vote.
 - Never invent unobserved hardware, network, operating-system, profiler, or
   device-health signals.
@@ -220,6 +223,9 @@ specific causes in confidence order; item 1 is the primary cause. `Low`
 confidence is allowed, but every cause needs a concise evidence or uncertainty
 basis and must not contradict observed evidence. Use only the cause vocabulary
 in [diagnostic-experience.md](references/diagnostic-experience.md).
+`Sequence-length anomaly` may rank first among causes when its score pattern is
+strong, although it is a workload/data condition rather than one of the four
+fault domains; keep unsupported infrastructure-domain confidence low.
 
 Apply this diagnosis contract only when the selected phase contains at least one
 association entry. If it contains none, report the stored association status and
@@ -246,14 +252,14 @@ Reasoning basis: <two or three concise professional sentences covering the stron
 
 ```text
 Primary fault domain: Network (confidence: Medium)
-Secondary fault domain: Compute (confidence: Low) — throughput and MFU degradation also permit compute contention.
+Secondary fault domain: Compute (confidence: Low) — throughput and MFU metrics also have meaningful association scores.
 
 Likely fault causes:
-1. Parameter-plane network congestion (primary; confidence: Medium) — communication-sensitive latency and transfer backlog move together.
-2. Parameter-plane NIC bandwidth limitation (confidence: Low) — sustained throughput loss is compatible, but no direct NIC counter is present.
-3. AI Core overload (confidence: Low) — remains possible, but direct Cube utilization evidence is absent.
+1. Parameter-plane network congestion (primary; confidence: Medium) — transfer-queue and communication-sensitive latency metrics hold the strongest association scores.
+2. Parameter-plane NIC bandwidth limitation (confidence: Low) — the same score pattern is compatible, but no direct NIC counter is present.
+3. AI Core overload (confidence: Low) — MFU and throughput metrics provide weaker association evidence, and direct Cube evidence is absent.
 
-Reasoning basis: The strongest association evidence is concentrated in transfer-queue and latency metrics while sequence-length evidence is stable. The data supports a network-domain hypothesis, but it cannot directly locate the constrained component.
+Reasoning basis: The strongest association scores are concentrated in transfer-queue and latency metrics, while length and sequence metrics do not rank strongly. This supports a network-domain hypothesis but cannot locate the constrained component.
 ```
 
 Use this section only to interpret observed evidence. Do not provide operational
