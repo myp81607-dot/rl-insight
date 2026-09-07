@@ -145,8 +145,12 @@ Render every returned entry in the complete stored Top-25, or every returned
 entry when fewer than 25 are available. Group entries by the English metric
 category, sort categories by their highest association score in descending
 order, and sort metrics within each category by association score in descending
-order. Break score ties by the stored `global_rank`. Category member count is
-not a fault decision.
+order. Break score ties by the stored `global_rank`. Keep every category in one
+contiguous block. Write the category name only in the first row of that block
+and leave the category cell blank in its remaining rows, even when the category
+contributes many Top-25 metrics. Do not repeat the category name and do not
+insert separator rows or horizontal rules between metrics or category blocks.
+Category member count is not a fault decision.
 
 The displayed table must contain only `Metric category`, `Metric name`, and
 `Association score`. Display stored `association_percent` in the
@@ -169,8 +173,10 @@ Saved result: /absolute/path/to/degradation-state/abnormal_data.json
 | Metric category | Metric name | Association score |
 |---|---|---:|
 | transfer_queue | tq_partition_consumption_progress | 94.80% |
-| transfer_queue | tq_storage_utilization_ratio | 91.25% |
+|  | tq_storage_utilization_ratio | 91.25% |
+|  | tq_storage_request_latency_p99 | 89.10% |
 | latency | rl_insight_monitor_perf_throughput | 88.60% |
+|  | rl_insight_monitor_perf_time_per_step | 84.30% |
 | hardware_resources | rl_insight_monitor_perf_mfu_actor | 81.40% |
 
 Treat association score as relative evidence, never fault probability, causal
