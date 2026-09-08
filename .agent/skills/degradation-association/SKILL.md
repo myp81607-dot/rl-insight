@@ -172,14 +172,18 @@ Category member count is not a fault decision.
 The displayed table must contain only `Metric category`, `Metric name`, and
 `Association score`. Display stored `association_percent` in the
 `Association score` column. Use a compact Markdown table with ordinary pipe and
-hyphen separators.
-Do not add labels, direction, rank, correlation, random-forest fields, or
-commentary inside this table. The complete deterministic event record remains
-saved at
+hyphen separators. This table is mandatory: do not replace it with JSON,
+bullets, prose, or a summary; do not add, remove, rename, or reorder columns;
+and do not omit returned Top-K rows. Copy the stored `association_percent`
+number directly and append `%`; never multiply, divide, normalize, or
+recalculate it. Do not add labels, direction, rank, correlation, random-forest
+fields, or commentary inside this table. The complete deterministic event
+record remains saved at
 `<absolute-state-dir>/abnormal_data.json`; the formatted table is presented in
 the conversation and is not a separate persisted file.
 
-Illustrative format (the live report must include all returned Top-25 entries):
+Mandatory output format (reproduce this structure exactly and include every
+returned Top-K entry):
 
 ```text
 Abnormal target metric: rl_insight_monitor_timing_s_step
