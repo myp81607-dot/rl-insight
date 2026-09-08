@@ -20,11 +20,13 @@ Start CLI
   -> classify new target and candidate points
   -> confirm a target event with the 3-of-5 rule
   -> run correlation and random-forest association analysis
+  -> refresh latest once per active monitor poll with new complete steps
   -> save the default Top-25 to abnormal_data.json
 ```
 
-Association runs once when an event is confirmed and again when the same event is
-closed.
+Association runs at confirmation, once per monitor poll that yields new complete
+steps while the same event is active, and once more when the event closes. Active
+refreshes overwrite that event's `latest` result instead of creating duplicates.
 
 ## Layout
 
@@ -88,6 +90,10 @@ baseline initialization and remains running until stopped. The CLI is a
 foreground process; an agent that must keep responding while it runs should keep
 it attached to one persistent terminal/session rather than starting a second
 replacement monitor process after baseline training.
+
+When the terminal tool exposes a timeout, configure at least 18,000 seconds (5
+hours), or no timeout. Monitoring is expected to run on a scale longer than 5
+hours by default and still continues until explicitly stopped.
 
 After starting `monitor`, the agent should keep the task active and continue
 waiting on the same terminal/session until the user explicitly asks to stop. It
@@ -153,15 +159,14 @@ Baseline fitting must retain at least one configured target and one configured
 candidate. Otherwise initialization exits instead of starting a monitor that
 cannot produce target events or association evidence.
 
-Correlation and random-forest association are always active. Runtime analyzes
-and persists evidence at both confirmed and closed transitions. An agent watching
-the monitor should leave its session untouched, run `show --event all --phase
-both` in a separate temporary command session, and report exactly one event
-matched by target metric plus `confirmed_at_step` or `closed_at_step`. It then
-closes only the temporary session and resumes polling the original monitor.
-Confirmed and closed are separate reports for each target transition, not
-reports for each associated candidate metric. An event report is not a final
-answer.
+Correlation and random-forest association are always active. Runtime persists
+the initial `confirmed` result, refreshes `latest` once per poll while the event
+remains active, and persists the final `closed` result. The same event is matched
+by target labels, `start_step`, and `confirmed_at_step`; latest refreshes overwrite
+that record instead of appending another event. An agent reports confirmed and
+closed using `show --event all --phase both`, reports updates using `--phase
+latest`, closes only the temporary inspection session, and resumes polling the
+original monitor. An event report is not a final answer.
 
 For a valid unique event with association evidence, the agent ranks exactly two
 distinct fault domains from `Compute`, `Network`, `Host CPU`, and `HBM`, then
@@ -222,8 +227,9 @@ operation, or omit the subcommand to view the compatible legacy option list.
 ## Inspect with the Core CLI
 
 `show` defaults to the latest stored event and `auto` phase: it selects `closed`
-when available and otherwise `confirmed`. `--event latest|all` and `--phase
-auto|confirmed|closed|both` provide explicit alternatives.
+when available, otherwise `latest` when present, and otherwise `confirmed` for
+older state. `--event latest|all` and `--phase
+auto|confirmed|latest|closed|both` provide explicit alternatives.
 
 The CLI groups the stored flat Top-K under `top_k_by_category` without changing
 either JSON file. The agent renders the grouped result as a score-descending,
@@ -248,9 +254,9 @@ is `uninitialized`. Legacy `--reset` does not provide this flow.
 
 - `<state-dir>/standard_data.json` stores fitted normal ranges and baseline
   parameters. It does not store the original 30-step observations.
-- `<state-dir>/abnormal_data.json` stores confirmed and closed events, target
-  direction, Top-K candidate direction, association percentage, correlation
-  values, and random-forest components.
+- `<state-dir>/abnormal_data.json` stores confirmed, mutable latest, and closed
+  association snapshots, target direction, Top-K candidate direction,
+  association percentage, correlation values, and random-forest components.
 
 The compact Markdown association table and root-cause narrative are conversation
 output; the CLI does not persist a separate formatted report file.

@@ -200,7 +200,7 @@ def _build_subcommand_parser() -> argparse.ArgumentParser:
     show.add_argument("--event", choices=("latest", "all"), default="latest")
     show.add_argument(
         "--phase",
-        choices=("auto", "confirmed", "closed", "both"),
+        choices=("auto", "confirmed", "latest", "closed", "both"),
         default="auto",
     )
     show.add_argument("--state-dir", type=Path, default=Path.cwd())

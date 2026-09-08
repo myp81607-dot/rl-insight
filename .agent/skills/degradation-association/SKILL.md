@@ -95,12 +95,19 @@ python -m experiment.degradation.cli monitor \
 With no baseline, the same process collects 30 complete new steps, writes the
 baseline after the next-step boundary, and immediately continues detection. With
 an existing baseline, it loads the file and starts detection immediately.
-Correlation and random-forest association run automatically for every confirmed
-and closed target transition.
+Correlation and random-forest association run at confirmation, refresh once per
+monitor poll that yields new complete steps while the same event remains active,
+and run once more at closure.
 
 ### Continuous monitoring invariant
 
-- Run `monitor` as a foreground process inside one persistent terminal/session.
+- Run `monitor` as a foreground process inside one persistent terminal/session
+  dedicated to monitoring, and use the conversation as the reporting surface.
+  Treat that session as the background monitoring worker; keep `monitor`
+  attached rather than daemonizing it.
+  If the shell tool exposes a timeout, set it to at least 18,000 seconds
+  (5 hours), or unlimited. Treat more than 5 hours as the default monitoring
+  scale, not as an automatic stop time.
 - Keep waiting on and polling that same session until the user explicitly asks
   to stop. Do not detach, daemonize, replace, or prematurely restart it.
 - Do not return a final answer after startup or baseline completion.
@@ -112,11 +119,11 @@ and closed target transition.
   ```
 
 - That notification is not completion. Continue watching the same process.
-- On every `Confirmed event` and `Closed event`, inspect and report immediately,
-  then resume waiting without another user prompt.
+- On every `Confirmed event`, `Updated event`, and `Closed event`, inspect and
+  report immediately, then resume waiting without another user prompt.
 
-Leave the foreground monitor session untouched. Inspect transitions in a
-separate temporary command session with:
+Leave the monitor session untouched. Inspect confirmed and closed transitions in
+a separate temporary command session with:
 
 ```bash
 python -m experiment.degradation.cli show \
@@ -124,13 +131,23 @@ python -m experiment.degradation.cli show \
   --state-dir "$HOME/.local/state/rl-insight/degradation/default"
 ```
 
+Inspect an `Updated event` notification with:
+
+```bash
+python -m experiment.degradation.cli show \
+  --kind events --event all --phase latest \
+  --state-dir "$HOME/.local/state/rl-insight/degradation/default"
+```
+
 After reporting, close only the temporary command session and resume polling the
 original monitor session. Never return a final answer after an event report.
 
 Match exactly one stored event using the logged target metric plus transition
-step: `confirmed_at_step` for confirmed and `closed_at_step` for closed. Read only
-the matching phase. If zero or multiple events match, report the ambiguity and
-do not generate a diagnosis.
+step: `confirmed_at_step` for confirmed, `latest_analyzed_step` for updated, and
+`closed_at_step` for closed. Read only the matching phase. If zero or multiple
+events match, report the ambiguity and do not generate a diagnosis. A latest
+refresh overwrites the same event's previous `latest` association; it never
+creates a duplicate event or changes the original `confirmed` snapshot.
 
 Generate an anomaly report only for `status=ok` with a selected event. For
 `no_abnormal_events`, report that no event exists. For `uninitialized`, report
@@ -166,7 +183,7 @@ Illustrative format (the live report must include all returned Top-25 entries):
 
 ```text
 Abnormal target metric: rl_insight_monitor_timing_s_step
-Event phase: confirmed
+Event phase: confirmed|latest|closed
 Saved result: /absolute/path/to/degradation-state/abnormal_data.json
 ```
 

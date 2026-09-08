@@ -169,9 +169,11 @@ EventTracker 只接受严格按1递增的 step。重复、倒序或出现 step g
 
 ### Association boundary
 
-EventTracker 只发出 confirmed/closed 生命周期通知。runtime 在 target 首次 confirmed
-时调用一次 association，并在同一事件 closed 后再调用一次。candidate 只需要 point-level
-异常结果，不要求形成正式事件；`detector.py` 不包含相关系数、随机森林或 Top-K 逻辑。
+EventTracker 只发出 confirmed/closed 生命周期通知，并可提供当前 active event 的只读快照。
+runtime 在 target 首次 confirmed 时调用一次 association；事件持续 active 时，每个产生新完整
+step 的 monitor poll 最多刷新一次同一事件的 latest association；同一事件 closed 后再调用一次。candidate
+只需要 point-level 异常结果，不要求形成正式事件；`detector.py` 不包含相关系数、随机森林或
+Top-K 逻辑。
 
 ## Association contract
 
@@ -186,6 +188,7 @@ runtime 按 global step 选择分析窗口：
 
 ```text
 confirmed: [event.start_step - pre_context_steps, event.confirmed_at_step]
+latest:    [event.start_step - pre_context_steps, latest_analyzed_step]
 closed:    [event.start_step - pre_context_steps, event.closed_at_step]
 ```
 
@@ -306,9 +309,11 @@ Prometheus 查询或 step 对齐抛错时不会推进 cursor。
 
 ### Event persistence
 
-target confirmed 和同一事件 closed 时各执行一次 association。confirmed 分析创建事件记录；
-closed 分析更新同一条记录。candidate 方向定义为 target 实际事件区间内 point-level abnormal
-方向的众数；平票为 `MIXED`，没有 candidate abnormal 点为 `NORMAL`。
+target confirmed 时创建事件记录并保存不可变的 confirmed association。事件持续 active 时，
+runtime 在每轮产生新完整 step 的 monitor poll 结束后最多计算一次 latest association，并用 target labels、
+start_step 和 confirmed_at_step 定位同一条记录后覆盖 latest；不会追加重复事件。同一事件
+closed 时写入最终 closed association。candidate 方向定义为 target 实际事件区间内
+point-level abnormal 方向的众数；平票为 `MIXED`，没有 candidate abnormal 点为 `NORMAL`。
 
 `standard_data.json` 只保存：
 
@@ -316,10 +321,10 @@ closed 分析更新同一条记录。candidate 方向定义为 target 实际事�
 - global-step `SeriesId`；
 - 每个 metric `SeriesId` 的冻结 `NormalRange`、样本数和 KDE 诊断字段。
 
-它不保存原始30-step训练值。`abnormal_data.json` 长期保存事件，以及 confirmed/closed 两阶段
-各自的 Top-K、`association_percent`、Pearson、Spearman、correlation share、RF importance
-和 RF share。`association_percent = association_score × 100`，仍然只是相对关联证据，不是因果
-贡献率。
+它不保存原始30-step训练值。`abnormal_data.json` 长期保存事件，以及 confirmed、latest、
+closed 三种 association 快照各自的 Top-K、`association_percent`、Pearson、Spearman、
+correlation share、RF importance 和 RF share。`association_percent = association_score × 100`，
+仍然只是相对关联证据，不是因果贡献率。
 
 ### Restart and reset boundary
 

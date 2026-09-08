@@ -115,14 +115,18 @@ Classify each point relative to all fitted normal ranges:
 ### Output
 
 Emit deterministic `confirmed` and `closed` lifecycle transitions for target
-events. Candidate point states are evidence for association; they do not create
-target events.
+events. While an event remains active, runtime refreshes its `latest`
+association once per monitor poll that yields new complete steps, without
+creating a new event. Candidate point states are evidence for association; they
+do not create target events.
 
 ## 4. Association Analysis
 
 ### Trigger and Input
 
-- Analyze once when an event is confirmed and again when the same event closes.
+- Analyze once when an event is confirmed, refresh once per monitor poll that
+  yields new complete steps while that same event remains active, and analyze
+  once more when it closes.
 - Align target and candidate values by identical global steps.
 - Delete missing pairs only for the affected candidate.
 - Admit to random-forest analysis only candidates with point-level abnormality
@@ -155,10 +159,12 @@ causality, degradation magnitude, or an independently calibrated probability.
 | File | Stored content |
 |---|---|
 | `standard_data.json` | Frozen baseline, schema version 1 |
-| `abnormal_data.json` | Confirmed and closed event records, schema version 1 |
+| `abnormal_data.json` | Confirmed, mutable latest, and closed association snapshots, schema version 1 |
 
 Retain 30 pre-event context steps. The baseline file stores the fitted result,
-not the original 30-step observations.
+not the original 30-step observations. Keep the original `confirmed` snapshot,
+overwrite only `latest` for the same active event, and finalize `closed` when
+the event recovers.
 
 ### Runtime Boundaries
 

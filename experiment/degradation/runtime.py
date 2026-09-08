@@ -393,6 +393,24 @@ class DegradationRuntime:
                     context = self._active_contexts.pop(identity)
                     produced.append(self._analyze_event("closed", event, context))
             self._last_processed_step = frame.step
+
+        if frames:
+            latest_frame = frames[-1]
+            for identity, tracker in sorted(self.target_trackers.items()):
+                active_event = tracker.active_event
+                if (
+                    active_event is not None
+                    and latest_frame.step > active_event.confirmed_at_step
+                ):
+                    produced.append(
+                        self._analyze_event(
+                            "latest",
+                            active_event,
+                            self._active_contexts[identity],
+                            analyzed_at_step=latest_frame.step,
+                            analyzed_at_time=latest_frame.end_time,
+                        )
+                    )
         return tuple(produced)
 
     def _analyze_event(
@@ -400,6 +418,9 @@ class DegradationRuntime:
         phase: str,
         event: DegradationEvent,
         context: Sequence[Mapping[SeriesId, PointResult]],
+        *,
+        analyzed_at_step: int | None = None,
+        analyzed_at_time: float | None = None,
     ) -> RuntimeAssociation:
         target_points = [row[event.identity] for row in context]
         candidates = {
@@ -414,18 +435,36 @@ class DegradationRuntime:
             parameters=self.config.association,
         )
         top_associations = result.associations[: self.config.runtime.top_k]
-        self.storage.save_event(
-            phase,
-            event,
-            result,
-            top_associations,
-            _association_directions(top_associations, context, event),
-        )
+        directions = _association_directions(top_associations, context, event)
+        if phase == "latest":
+            self.storage.save_event(
+                phase,
+                event,
+                result,
+                top_associations,
+                directions,
+                analyzed_at_step=analyzed_at_step,
+                analyzed_at_time=analyzed_at_time,
+            )
+        else:
+            self.storage.save_event(
+                phase,
+                event,
+                result,
+                top_associations,
+                directions,
+            )
+        event_step = {
+            "confirmed": event.confirmed_at_step,
+            "latest": analyzed_at_step,
+            "closed": event.closed_at_step,
+        }[phase]
+        action = "Updated" if phase == "latest" else phase.capitalize()
         LOGGER.info(
             "%s event for %s at step %s (%s association items)",
-            phase.capitalize(),
+            action,
             event.identity.name,
-            event.confirmed_at_step if phase == "confirmed" else event.closed_at_step,
+            event_step,
             len(result.associations),
         )
         return RuntimeAssociation(phase=phase, event=event, result=result)

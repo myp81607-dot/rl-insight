@@ -280,6 +280,22 @@ class EventTracker:
         self.current_event: _ActiveEvent | None = None
         self._last_step: int | None = None
 
+    @property
+    def active_event(self) -> DegradationEvent | None:
+        """Return the current event snapshot without changing tracker state."""
+
+        if self.current_event is None:
+            return None
+        evidence_count = sum(
+            point.valid and point.abnormal and point.direction is Direction.UP
+            for point in self.recent_points
+        )
+        return _event_snapshot(
+            self.current_event,
+            self.parameters,
+            evidence_count,
+        )
+
     def update(self, point: PointResult) -> EventUpdate:
         """Consume one classified target point and emit lifecycle transitions."""
 

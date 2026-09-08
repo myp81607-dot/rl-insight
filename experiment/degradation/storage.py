@@ -487,11 +487,16 @@ class JsonStorage:
         result: AssociationResult,
         top_associations: Sequence[AssociationItem],
         directions: Mapping[SeriesId, str],
+        *,
+        analyzed_at_step: int | None = None,
+        analyzed_at_time: float | None = None,
     ) -> None:
-        """Create a confirmed event or update it when the event closes."""
+        """Create, refresh, or close one persisted event."""
 
-        if phase not in {"confirmed", "closed"}:
-            raise ValueError("phase must be confirmed or closed")
+        if phase not in {"confirmed", "latest", "closed"}:
+            raise ValueError("phase must be confirmed, latest, or closed")
+        if phase == "latest" and (analyzed_at_step is None or analyzed_at_time is None):
+            raise ValueError("latest phase requires its analysis step and time")
         payload = _load_abnormal_data(self.abnormal_data_path)
         events = payload["events"]
         association = _association_to_json(result, top_associations, directions)
@@ -510,7 +515,13 @@ class JsonStorage:
                     "closed_at_step": None,
                     "closed_at_time": None,
                     "abnormal_points": event.abnormal_points,
-                    "association": {"confirmed": association, "closed": None},
+                    "latest_analyzed_step": event.confirmed_at_step,
+                    "latest_analyzed_time": event.confirmed_at_time,
+                    "association": {
+                        "confirmed": association,
+                        "latest": association,
+                        "closed": None,
+                    },
                 }
             )
         else:
@@ -523,8 +534,10 @@ class JsonStorage:
                 and item.get("confirmed_at_step") == event.confirmed_at_step
             ]
             if len(matching) != 1:
-                raise StorageError("cannot find the confirmed event to close")
+                raise StorageError("cannot find the persisted event to update")
             record = matching[0]
+            if phase == "latest" and record.get("closed_at_step") is not None:
+                raise StorageError("cannot refresh a closed event")
             record.update(
                 {
                     "end_step": event.end_step,
@@ -537,7 +550,12 @@ class JsonStorage:
             stored_association = record.get("association")
             if not isinstance(stored_association, dict):
                 raise StorageError("abnormal_data.json is invalid")
-            stored_association["closed"] = association
+            if phase == "latest":
+                record["latest_analyzed_step"] = analyzed_at_step
+                record["latest_analyzed_time"] = analyzed_at_time
+                stored_association["latest"] = association
+            else:
+                stored_association["closed"] = association
         _write_json(self.abnormal_data_path, payload)
 
     def reset(self) -> None:

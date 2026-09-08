@@ -71,7 +71,13 @@ def _present_events(
         assert isinstance(association, dict)
         if phase_selection == "auto":
             selected_phases = [
-                "closed" if association.get("closed") is not None else "confirmed"
+                (
+                    "closed"
+                    if association.get("closed") is not None
+                    else "latest"
+                    if association.get("latest") is not None
+                    else "confirmed"
+                )
             ]
         elif phase_selection == "both":
             selected_phases = [
@@ -115,8 +121,8 @@ def present_state(
         raise ValueError("kind must be all, baseline, or events")
     if event not in {"latest", "all"}:
         raise ValueError("event must be latest or all")
-    if phase not in {"auto", "confirmed", "closed", "both"}:
-        raise ValueError("phase must be auto, confirmed, closed, or both")
+    if phase not in {"auto", "confirmed", "latest", "closed", "both"}:
+        raise ValueError("phase must be auto, confirmed, latest, closed, or both")
 
     if inspection.status is StateStatus.UNINITIALIZED:
         return {"status": inspection.status.value}

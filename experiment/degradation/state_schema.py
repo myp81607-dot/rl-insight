@@ -344,6 +344,16 @@ def validate_events_payload(
             raise StateValidationError(
                 f"{source} event association is missing a phase field"
             )
+        latest_association = association.get("latest")
+        latest_step = event.get("latest_analyzed_step")
+        latest_time = event.get("latest_analyzed_time")
+        if latest_association is not None:
+            latest_error = f"{source} event has inconsistent latest fields"
+            if not _is_integer(latest_step):
+                raise StateValidationError(latest_error)
+            _finite_number(latest_time, error=latest_error)
+        elif latest_step is not None or latest_time is not None:
+            raise StateValidationError(f"{source} event has inconsistent latest fields")
         closed_step = event.get("closed_at_step")
         closed_time = event.get("closed_at_time")
         closed_association = association.get("closed")
@@ -357,7 +367,7 @@ def validate_events_payload(
             if not _is_integer(closed_step):
                 raise StateValidationError(closed_error)
             _finite_number(closed_time, error=closed_error)
-        for phase in ("confirmed", "closed"):
+        for phase in ("confirmed", "latest", "closed"):
             phase_payload = association.get(phase)
             if phase_payload is None:
                 if phase == "confirmed":
