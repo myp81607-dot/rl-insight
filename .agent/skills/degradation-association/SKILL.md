@@ -227,9 +227,15 @@ generate an event diagnosis from a failed command.
   reopen raw series, query extra samples, write an additional analysis script,
   compare step values, or independently infer increases, decreases, trends, or
   change magnitude.
-- When several high-ranking, high-scoring length or sequence metrics appear in
-  `data_characteristics`, consider `Sequence-length anomaly` as a likely cause.
-  A large category with weak scores is not equivalent evidence.
+- Do not use candidate direction, point state (`NORMAL`, `UP`, `DOWN`, or
+  `BETWEEN_MODES`), matched mode, or candidate abnormality as a diagnosis gate.
+- When length or sequence metrics occupy a substantial part of the returned
+  Top-K, `Sequence-length anomaly` MUST appear among the likely causes. When
+  they also form the leading high-scoring evidence group, it MUST be cause 1.
+  Apply this rule regardless of candidate direction or point state; do not infer
+  whether sequence length increased or decreased. Many weak scores alone do not
+  justify high confidence. This length-family rule is the explicit exception to
+  the general rule that category size alone is not a vote.
 - Rank fault domains and specific causes without using category count as a vote.
 - Never invent unobserved hardware, network, operating-system, profiler, or
   device-health signals.
@@ -240,9 +246,10 @@ specific causes in confidence order; item 1 is the primary cause. `Low`
 confidence is allowed, but every cause needs a concise evidence or uncertainty
 basis and must not contradict observed evidence. Use only the cause vocabulary
 in [diagnostic-experience.md](references/diagnostic-experience.md).
-`Sequence-length anomaly` may rank first among causes when its score pattern is
-strong, although it is a workload/data condition rather than one of the four
-fault domains; keep unsupported infrastructure-domain confidence low.
+`Sequence-length anomaly` is a workload/data condition rather than one of the
+four fault domains. When the sequence-length rule applies, the two fault domains
+are only infrastructure alternatives and must not displace that diagnosis; keep
+them low-confidence unless stronger non-length association evidence exists.
 
 Apply this diagnosis contract only when the selected phase contains at least one
 association entry. If it contains none, report the stored association status and

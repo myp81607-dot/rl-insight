@@ -15,22 +15,28 @@ as `training_epoch` and `tq_controller_uptime_seconds` require corroboration.
 Use only the final `association_percent`, metric name, category, rank, target,
 and event phase when applying these priors. Do not inspect raw samples, calculate
 new statistics, compare before/after values, or infer whether a metric increased
-or decreased. Several semantically consistent high-scoring metrics are useful
-joint evidence; a category containing many weakly scored metrics is not.
+or decreased. Ignore candidate direction, point state (`NORMAL`, `UP`, `DOWN`,
+or `BETWEEN_MODES`), matched mode, and candidate abnormality when diagnosing;
+every returned Top-K item is association evidence. Several semantically
+consistent high-scoring metrics are useful joint evidence; a category containing
+many weakly scored metrics is not high-confidence evidence.
 
 ## Diagnostic vocabulary
 
 ### Workload/data condition
 
-- `Sequence-length anomaly`: consider this when several prompt-length,
-  response-length, global-sequence-length, or total-token metrics are both
-  high-ranking and high-scoring within `data_characteristics`. This is a
-  workload/data explanation rather than an infrastructure fault domain. Do not
-  claim that lengths increased, decreased, or changed by a particular amount;
-  the association result alone does not establish direction or magnitude.
+- `Sequence-length anomaly`: include this among the likely causes when
+  prompt-length, response-length, global-sequence-length, or total-token metrics
+  occupy a substantial part of the returned Top-K. Rank it as cause 1 when they
+  also form the leading high-scoring evidence group. This rule applies regardless
+  of candidate direction or point state. It is a workload/data explanation, not
+  an infrastructure fault domain. Do not claim that lengths increased,
+  decreased, or changed by a particular amount; association alone does not
+  establish direction or magnitude.
 
 Strong sequence-length association weakens an infrastructure-only explanation.
-One isolated length metric, or many low-scoring length metrics, is insufficient.
+One isolated length metric is insufficient. A substantial low-scoring group
+supports only low-confidence inclusion, not cause 1.
 
 ### Compute
 
@@ -116,11 +122,14 @@ length/sequence metrics dominate the association scores.
    closed transitions receive separate reports.
 2. Read all metrics in the grouped Top-25. Use metric meaning, category, global
    rank, and final association score only. Do not use raw values, direction,
-   labels, component scores, or independently calculated trends.
-3. Treat a coherent cluster of high-scoring length/sequence metrics as evidence
-   for `Sequence-length anomaly` before attributing latency only to
-   infrastructure. Treat training/rollout quality as downstream evidence unless
-   its metric semantics directly support a cause.
+   point state, candidate abnormality, labels, component scores, or independently
+   calculated trends.
+3. If length/sequence metrics occupy a substantial part of the Top-25, include
+   `Sequence-length anomaly` among the causes. If they form the leading
+   high-scoring group, make it cause 1 before considering infrastructure
+   alternatives. This semantic length-family rule is the explicit exception to
+   the general category-size rule. Treat training/rollout quality as downstream
+   evidence unless its metric semantics directly support a cause.
 4. Rank exactly two distinct fault domains and three to five specific causes;
    cause 1 is primary. `Low` confidence is allowed, but every item needs an
    evidence or uncertainty basis and must not contradict observed evidence. If
