@@ -147,6 +147,17 @@ Use the fault domains `Compute`, `Network`, `Host CPU`, and `HBM`. Rank exactly
 two distinct domains and three to five plausible causes in confidence order.
 Low confidence is acceptable. Keep the reasoning concise and do not claim
 unobserved hardware, network, profiler, or operating-system signals.
+Select every cause from the exact diagnostic vocabulary in
+`diagnostic-experience.md`. Causes must be distinct. Never use a metric category,
+component name, metric name, or symptom restatement such as `TransferQueue
+delay` as a cause.
+
+When multiple labeled series of `tq_storage_request_latency_p50` and/or
+`tq_storage_request_latency_p99` occupy a substantial part of the returned
+Top-K, make `Compute` the primary fault domain and include both `AI Core
+overload` and `NPU frequency throttling` among the likely causes. When that
+family is also the leading high-scoring evidence, rank them as the highest
+remaining causes after applying the sequence-length priority rule above.
 `Sequence-length anomaly` is a workload/data condition rather than one of the
 four fault domains. When the sequence-length rule applies, the two fault domains
 are only infrastructure alternatives and must not displace that diagnosis; keep

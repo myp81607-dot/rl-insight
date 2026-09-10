@@ -23,6 +23,9 @@ many weakly scored metrics is not high-confidence evidence.
 
 ## Diagnostic vocabulary
 
+The cause names in this section are a closed vocabulary. Use their exact names
+and do not invent aliases, component-level symptoms, or category restatements.
+
 ### Workload/data condition
 
 - `Sequence-length anomaly`: include this among the likely causes when
@@ -72,12 +75,12 @@ metrics.
   often followed by recovery or a closed event, consistent with a temporary
   link interruption.
 
-Prefer Network when communication-sensitive timing and transfer-queue metrics
-receive strong association scores while length/sequence metrics do not. Strong
-transfer-queue association is propagation evidence, not proof of a
-parameter-plane fault. With the current catalog, the first three sustained
-restrictions are usually observationally equivalent; rank them as possible
-causes without pretending to locate the restriction.
+Prefer Network only when communication-sensitive timing evidence supports it
+while length/sequence metrics do not. TransferQueue association alone is
+propagation evidence, not proof of a parameter-plane fault. With the current
+catalog, the first three sustained restrictions are usually observationally
+equivalent; rank them as possible causes without pretending to locate the
+restriction.
 
 Evidence that weakens Network: association scores are concentrated in rollout,
 vLLM, or length/sequence metrics and communication-related metrics rank weakly.
@@ -116,6 +119,20 @@ bandwidth/pressure evidence is required for a high-confidence subtype claim.
 Evidence that weakens HBM: memory metrics rank weakly while communication or
 length/sequence metrics dominate the association scores.
 
+### TransferQueue evidence
+
+TransferQueue is an inter-stage sample data gateway, not a fault domain or an
+allowed cause name. Never output `TransferQueue delay`, `TransferQueue latency`,
+or similar symptom restatements as a likely cause.
+
+When multiple labeled series of `tq_storage_request_latency_p50` and/or
+`tq_storage_request_latency_p99` occupy a substantial part of Top-K, use the
+experiment prior: make `Compute` the primary fault domain and include both `AI
+Core overload` and `NPU frequency throttling` among the likely causes. When this
+family is the leading high-scoring evidence, rank them as the highest remaining
+causes after the sequence-length priority rule. This is a fallible diagnostic
+prior, not proof that TransferQueue itself caused the event.
+
 ## Synthesis rules
 
 1. Match the exact final target event before diagnosing. Offline output reports
@@ -131,11 +148,12 @@ length/sequence metrics dominate the association scores.
    alternatives. This semantic length-family rule is the explicit exception to
    the general category-size rule. Treat training/rollout quality as downstream
    evidence unless its metric semantics directly support a cause.
-4. Rank exactly two distinct fault domains and three to five specific causes;
-   cause 1 is primary. `Low` confidence is allowed, but every item needs an
-   evidence or uncertainty basis and must not contradict observed evidence. If
-   the selected phase has no association entries, report insufficient root-cause
-   evidence instead of fabricating this ranking.
+4. Rank exactly two distinct fault domains and three to five distinct causes
+   from the diagnostic vocabulary; cause 1 is primary. `Low` confidence is
+   allowed, but every item needs an evidence or uncertainty basis and must not
+   contradict observed evidence. If the selected phase has no association
+   entries, report insufficient root-cause evidence instead of fabricating this
+   ranking.
 5. Keep the reasoning concise and professional. Do not invent profiler, network,
    frequency, CPU, HBM, ECC/RAS, or device-health observations.
 
@@ -149,6 +167,8 @@ length/sequence metrics dominate the association scores.
   documents memory-access and bandwidth analysis.
 - [HCCL alpha-beta model](https://www.hiascend.com/document/detail/en/canncommercial/850/commlib/hcclug/hcclug_000115.html)
   relates communication time to latency and per-byte transfer cost.
+- [Ascend TransferQueue](https://github.com/Ascend/TransferQueue) describes its
+  control plane, storage data plane, and post-training producer-consumer role.
 - [Linux CPU hotplug](https://docs.kernel.org/core-api/cpu_hotplug.html),
   [CPUFreq](https://docs.kernel.org/admin-guide/pm/cpufreq.html), and
   [Pressure Stall Information](https://docs.kernel.org/accounting/psi.html)
