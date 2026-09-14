@@ -1,7 +1,8 @@
 # Offline degradation association
 
-RL-Insight 的离线性能劣化分析模块（包名 `perf_analysis`）。对用户选定的时间
-范围，从本地 Prometheus TSDB 执行一次性的劣化检测与关联分析：拟合或加载
+RL-Insight 的离线性能劣化分析模块（Python 包名
+`recipe.perf_analysis.degradation`）。对用户选定的时间范围，从本地 Prometheus
+TSDB 执行一次性的劣化检测与关联分析：拟合或加载
 KDE 基线、按 3-of-5 规则跟踪 target 事件、对每个最终事件做 Top-25 关联
 排序，并把证据与报告落到 `analysis/` 目录。
 
@@ -12,8 +13,8 @@ KDE 基线、按 3-of-5 规则跟踪 target 事件、对每个最终事件做 To
 
 本模块对应的 Agent Skill 为
 [`degradation-association-offline`](../../../.agent/skills/degradation-association-offline/SKILL.md)。
-它会定位仓库、执行只读预检、调用 `perf_analysis` 完成分析，并把关联证据转成
-紧凑的 Markdown 报告与根因推断。
+它会定位仓库、执行只读预检、调用 `recipe.perf_analysis.degradation` 完成分析，
+并把关联证据转成紧凑的 Markdown 报告与根因推断。
 
 Skill 位于仓库根，需在 `rl_insight` 仓库根目录执行。默认使用 RL-Insight 本地
 Prometheus TSDB（`~/.rl-insight/data/prometheus`），报告根目录默认为
