@@ -23,8 +23,7 @@ import numpy as np
 from scipy.signal import find_peaks, peak_prominences  # type: ignore[import-untyped]
 from scipy.stats import gaussian_kde  # type: ignore[import-untyped]
 
-from .series import SeriesId
-from .window import StepFrame
+from .data import SeriesId, StepFrame
 
 
 class BaselineDataError(ValueError):

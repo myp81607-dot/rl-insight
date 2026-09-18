@@ -27,7 +27,7 @@ from sklearn.inspection import permutation_importance  # type: ignore[import-unt
 from sklearn.metrics import balanced_accuracy_score  # type: ignore[import-untyped]
 
 from .detector import PointResult, Policy
-from .series import SeriesId
+from .data import SeriesId
 
 
 class AssociationError(ValueError):

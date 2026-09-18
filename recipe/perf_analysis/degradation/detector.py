@@ -23,8 +23,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from .baseline import NormalRange, SeriesBaseline
-from .series import SeriesId
-from .window import StepFrame
+from .data import SeriesId, StepFrame
 
 
 class DetectorError(ValueError):

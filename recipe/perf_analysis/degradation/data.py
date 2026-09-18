@@ -12,17 +12,159 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Align Prometheus time series to training-step intervals."""
+"""Data model, local TSDB input, and training-step alignment for offline analysis."""
 
 from __future__ import annotations
 
+import json
 import math
+import re
+import shutil
+import subprocess
 from bisect import bisect_left
+from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
-from .series import SeriesId, TimeSeries
+class SeriesDataError(ValueError):
+    """Offline series data is malformed."""
 
+
+@dataclass(frozen=True, order=True)
+class SeriesId:
+    """A Prometheus series identified by metric name and labels."""
+
+    name: str
+    labels: tuple[tuple[str, str], ...] = ()
+
+    @classmethod
+    def from_label_set(cls, value: Mapping[str, Any]) -> SeriesId:
+        if not isinstance(value, Mapping):
+            raise SeriesDataError("series labels must be an object")
+        name = value.get("__name__")
+        if not isinstance(name, str) or not name:
+            raise SeriesDataError("series is missing __name__")
+        labels = []
+        for key, label_value in value.items():
+            if not isinstance(key, str) or not isinstance(label_value, str):
+                raise SeriesDataError("series labels must be strings")
+            if key != "__name__":
+                labels.append((key, label_value))
+        return cls(name=name, labels=tuple(sorted(labels)))
+
+    def to_label_set(self) -> dict[str, str]:
+        return {"__name__": self.name, **dict(self.labels)}
+
+
+@dataclass(frozen=True)
+class Sample:
+    timestamp: float
+    value: float
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.timestamp) or not math.isfinite(self.value):
+            raise SeriesDataError("sample timestamp and value must be finite")
+
+
+@dataclass(frozen=True)
+class TimeSeries:
+    identity: SeriesId
+    samples: tuple[Sample, ...]
+
+
+# --- TSDB input: Read a selected time range directly from a local Prometheus TSDB. ---
+
+DEFAULT_TSDB_DIR = Path.home() / ".rl-insight" / "data" / "prometheus"
+DEFAULT_PROMTOOL_ROOT = Path.home() / ".rl-insight" / "services" / "prometheus"
+
+_SAMPLE_LINE = re.compile(r"^(\{.*\})\s+(\S+)\s+(-?\d+)$")
+_LABEL = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)=("(?:\\.|[^"\\])*")')
+
+
+class OfflineInputError(ValueError):
+    """The local TSDB cannot provide the requested samples."""
+
+
+def _promtool(explicit: Path | None) -> Path:
+    if explicit is not None:
+        return explicit.expanduser()
+    system = shutil.which("promtool")
+    if system:
+        return Path(system)
+    installed = sorted(DEFAULT_PROMTOOL_ROOT.rglob("promtool"))
+    if installed:
+        return installed[-1]
+    raise OfflineInputError("promtool was not found")
+
+
+def _label_set(value: str) -> dict[str, str]:
+    return {
+        match.group(1): json.loads(match.group(2)) for match in _LABEL.finditer(value)
+    }
+
+
+def _parse_dump(output: str) -> tuple[TimeSeries, ...]:
+    merged: dict[SeriesId, dict[float, float]] = defaultdict(dict)
+    for line in output.splitlines():
+        match = _SAMPLE_LINE.match(line.strip())
+        if match is None:
+            continue
+        try:
+            identity = SeriesId.from_label_set(_label_set(match.group(1)))
+            value = float(match.group(2))
+            timestamp = int(match.group(3)) / 1000.0
+        except (SeriesDataError, ValueError, json.JSONDecodeError):
+            continue
+        if math.isfinite(value):
+            merged[identity][timestamp] = value
+    return tuple(
+        TimeSeries(
+            identity=identity,
+            samples=tuple(
+                Sample(timestamp, value) for timestamp, value in sorted(samples.items())
+            ),
+        )
+        for identity, samples in sorted(merged.items())
+        if samples
+    )
+
+
+def load_time_series(
+    data_dir: Path,
+    *,
+    start_time: float,
+    end_time: float,
+    metric_names: frozenset[str],
+    promtool_path: Path | None = None,
+) -> tuple[TimeSeries, ...]:
+    """Dump configured scalar series from the RL-Insight Prometheus TSDB."""
+
+    selector = (
+        '{__name__=~"^(' + "|".join(sorted(map(re.escape, metric_names))) + ')$"}'
+    )
+    command = [
+        str(_promtool(promtool_path)),
+        "tsdb",
+        "dump",
+        f"--min-time={int(start_time * 1000)}",
+        f"--max-time={int(end_time * 1000)}",
+        f"--match={selector}",
+        str(data_dir.expanduser()),
+    ]
+    completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    if completed.returncode:
+        raise OfflineInputError(completed.stderr.strip() or "promtool tsdb dump failed")
+    series = _parse_dump(completed.stdout)
+    if not series:
+        raise OfflineInputError(
+            "the selected time range contains no configured metrics"
+        )
+    return series
+
+
+# --- Step alignment: Align Prometheus time series to training-step intervals. ---
 
 class WindowError(ValueError):
     """The input time series cannot form valid step frames."""
@@ -148,8 +290,15 @@ def build_step_frames(
 
 
 __all__ = [
+    "DEFAULT_TSDB_DIR",
     "MissingGlobalStepError",
+    "OfflineInputError",
+    "Sample",
+    "SeriesDataError",
+    "SeriesId",
     "StepFrame",
+    "TimeSeries",
     "WindowError",
     "build_step_frames",
+    "load_time_series",
 ]
