@@ -13,7 +13,7 @@ Read [algorithm-contract.md](references/algorithm-contract.md) before running th
 analysis. Read [diagnostic-experience.md](references/diagnostic-experience.md)
 only when at least one final event contains association entries.
 Use the exact Chinese metric meanings in
-[metric-name-catalog.md](../../../docs/recipe/metrics/metric-name-catalog.md) when
+[metric-name-catalog.md](../../../docs/monitor/metric-name-catalog.md) when
 rendering association tables.
 
 ## 1. Environment check
@@ -89,7 +89,7 @@ repeat the category name and do not insert separator rows or horizontal rules
 between metrics or category blocks. The following table is mandatory: do not
 replace it with JSON, bullets, prose, or a summary; do not add, remove, rename,
 or reorder columns; and do not omit returned Top-K rows. Copy each Chinese
-meaning verbatim from `docs/recipe/metrics/metric-name-catalog.md`; do not
+meaning verbatim from `docs/monitor/metric-name-catalog.md`; do not
 translate, shorten, or infer it. Copy the stored `association_percent` number directly and
 append `%`; never multiply, divide, normalize, or recalculate it. Reproduce this
 structure exactly:

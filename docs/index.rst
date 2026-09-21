@@ -19,6 +19,7 @@ To collect CPU, memory, disk, network, or Ascend NPU metrics, start with
    Quick Start <monitor/quick_start>
    Server Installation <monitor/server_installation>
    Hardware Monitoring <monitor/hardware/index>
+   Metric Name Catalog <monitor/metric-name-catalog>
 
 .. toctree::
    :hidden:
@@ -36,7 +37,6 @@ To collect CPU, memory, disk, network, or Ascend NPU metrics, start with
    RL Timeline quickstart <recipe/overview/RL_Timeline_quickstart>
    GMM Expert Load visualization quickstart <recipe/overview/gmm_heatmap_quickstart>
    Memory quickstart <recipe/overview/memory_quickstart>
-   Metric Name Catalog <recipe/metrics/metric-name-catalog>
 
 .. toctree::
    :maxdepth: 2

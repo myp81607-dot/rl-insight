@@ -100,5 +100,5 @@ flowchart TD
 
 - Skill 操作指南：[`degradation-association-offline/SKILL.md`](../../../.agent/skills/degradation-association-offline/SKILL.md)
 - 算法契约：[`references/algorithm-contract.md`](../../../.agent/skills/degradation-association-offline/references/algorithm-contract.md)
-- 指标中文释义：[`metric-name-catalog.md`](../../../docs/recipe/metrics/metric-name-catalog.md)
+- 指标中文释义：[`metric-name-catalog.md`](../../../docs/monitor/metric-name-catalog.md)
 - 根因经验参考：[`references/diagnostic-experience.md`](../../../.agent/skills/degradation-association-offline/references/diagnostic-experience.md)
